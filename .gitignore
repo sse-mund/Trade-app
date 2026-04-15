@@ -1,0 +1,43 @@
+# Python virtual env
+backend/Lib/
+backend/Scripts/
+backend/Include/
+backend/pyvenv.cfg
+backend/__pycache__/
+backend/**/__pycache__/
+
+# Database
+backend/*.db
+
+# Logs
+backend/logs/
+
+# Env
+backend/.env
+
+# Training data (large files)
+backend/training/*.jsonl
+
+# Node modules
+frontend/node_modules/
+
+# Build output
+frontend/dist/
+
+# IDE
+.vscode/
+
+# Old files
+*.old
+
+# Test artifacts
+backend/test_*.py
+backend/test_*.txt
+backend/test_*.log
+backend/test_*.db
+backend/reproduce_*.py
+backend/verify_*.py
+backend/run_*.py
+
+# Cache
+backend/data/cache/

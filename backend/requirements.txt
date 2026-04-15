@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+yfinance
+pandas
+numpy
+httpx
+pytest
+pytest-asyncio
+finnhub-python
+python-dotenv
+tweepy
+praw
+vaderSentiment
+langgraph
+langchain-ollama

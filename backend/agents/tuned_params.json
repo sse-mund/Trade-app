@@ -1,0 +1,25 @@
+{
+  "pattern_weight": 0.65,
+  "rsi_oversold": 30,
+  "rsi_overbought": 75,
+  "signal_threshold": 0.2,
+  "quant_weight": 0.35,
+  "_validation": {
+    "method": "walk_forward",
+    "tickers": [
+      "NVDA",
+      "AAPL",
+      "MSFT",
+      "AMZN",
+      "GOOGL",
+      "META",
+      "TSLA",
+      "AMD"
+    ],
+    "train_ratio": 0.6,
+    "train_sharpe": 1.198,
+    "test_sharpe": 1.103,
+    "overfit_pct": 7.9,
+    "overfit_verdict": "robust"
+  }
+}
