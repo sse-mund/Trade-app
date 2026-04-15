@@ -40,13 +40,13 @@ class AgentState(TypedDict):
 # ────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are an expert stock market analyst. You synthesize data from three analysis agents:
-- Pattern Agent: identifies chart patterns, support/resistance, breakouts, trend, Ichimoku Cloud
-- Quant Agent: analyzes RSI, volume, volatility, Bollinger Bands, Ichimoku Cloud momentum
+- Pattern Agent: identifies chart patterns, support/resistance, breakouts, trend
+- Quant Agent: analyzes RSI, volume, volatility, Bollinger Bands
 - Sentiment Agent: scores news sentiment from articles
 
-Analyze the data provided and respond with a JSON object (no markdown, no code fences) containing EXACTLY these keys:
+Analyze the data provided and respond with ONLY a JSON object containing:
 {
-  "recommendation": "BUY" or "SELL" or "HOLD" (REQUIRED - must be one of these three exact strings),
+  "recommendation": "BUY" or "SELL" or "HOLD",
   "confidence": 0.0 to 1.0,
   "target_price": a realistic target price number,
   "stop_loss": a stop loss price number,
@@ -59,17 +59,11 @@ Analyze the data provided and respond with a JSON object (no markdown, no code f
   "risk_factors": an array of 1-4 specific risk strings
 }
 
-IMPORTANT: The "recommendation" field is MANDATORY. You MUST set it to exactly "BUY", "SELL", or "HOLD". Never omit it.
-
-CRITICAL RULES for target_price and stop_loss:
-- target_price MUST be based on a specific support or resistance level from the data. For BUY, use the nearest resistance above current price. For SELL, use the nearest support below.
-- stop_loss MUST be based on a specific support or resistance level. For BUY, place below the nearest support with a small buffer. For SELL, place above the nearest resistance.
-- If no levels are available, use a conservative 3-5% from current price and state this in trade_reasoning.
-- NEVER invent arbitrary round numbers. Every price must be justified by actual data.
-- trade_reasoning must explicitly state which level or indicator determined each price.
-
-Be specific — reference actual numbers (RSI values, price levels, volume ratios) in your reasoning.
-Do NOT include any text outside the JSON object."""
+Rules:
+- "recommendation" MUST be exactly "BUY", "SELL", or "HOLD". Never omit it.
+- target_price and stop_loss should be based on support/resistance levels from the data.
+- Be specific — reference actual numbers (RSI values, price levels, volume ratios).
+- Do NOT include any text outside the JSON object."""
 
 
 def _build_analysis_prompt(state: AgentState) -> str:
@@ -92,10 +86,6 @@ def _build_analysis_prompt(state: AgentState) -> str:
     sections.append(f"""
 ## Pattern Agent (Signal: {pattern.get('signal', 0)}, Confidence: {pattern.get('confidence', 0):.2f})
 - Trend: {p_metrics.get('trend', 'unknown')}
-- Ichimoku Trend: {p_metrics.get('ichimoku_trend', 'N/A')}
-- Ichimoku Momentum: {p_metrics.get('ichimoku_momentum', 'N/A')}
-- Cloud Support: {p_metrics.get('cloud_support', 'N/A')}
-- Cloud Resistance: {p_metrics.get('cloud_resistance', 'N/A')}
 - Breakout: {p_metrics.get('breakout', {}).get('type', 'none')}
 - Support levels: {p_metrics.get('support_levels', [])}
 - Resistance levels: {p_metrics.get('resistance_levels', [])}
@@ -106,9 +96,6 @@ def _build_analysis_prompt(state: AgentState) -> str:
 - Relative Volume: {q_metrics.get('relative_volume', 'N/A')}
 - BB Width: {q_metrics.get('bb_width', 'N/A')}
 - Squeeze: {q_metrics.get('is_squeezing', False)}
-- Ichimoku Signal: {q_metrics.get('ichimoku_signal', 'N/A')}
-- Ichimoku Trend: {q_metrics.get('ichimoku_trend', 'N/A')}
-- Ichimoku TK Cross: {q_metrics.get('ichimoku_tk_cross', 'N/A')}
 - Reasoning: {quant.get('reasoning', 'N/A')}
 
 ## Sentiment Agent (Signal: {sentiment.get('signal', 0)}, Confidence: {sentiment.get('confidence', 0):.2f})
@@ -123,6 +110,7 @@ def _build_analysis_prompt(state: AgentState) -> str:
         ))
 
     return "\n".join(sections)
+
 
 
 # ────────────────────────────────────────────────────────────────────────────

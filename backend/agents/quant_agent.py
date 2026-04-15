@@ -3,7 +3,6 @@ from typing import Dict, Any, List
 import pandas as pd
 import numpy as np
 from .base_agent import BaseAgent
-from indicators.ichimoku import analyze_ichimoku
 
 class QuantAgent(BaseAgent):
     """
@@ -30,10 +29,9 @@ class QuantAgent(BaseAgent):
         
         # Default weights (can be overridden by user)
         DEFAULT_WEIGHTS = {
-            "momentum": 0.30,
-            "ichimoku": 0.25,
-            "volume": 0.25,
-            "volatility": 0.20,
+            "momentum": 0.40,
+            "volume": 0.35,
+            "volatility": 0.25,
         }
         user_weights = data.get('quant_weights') or {}
         weights = {**DEFAULT_WEIGHTS, **{k: v for k, v in user_weights.items() if k in DEFAULT_WEIGHTS}}
@@ -52,13 +50,9 @@ class QuantAgent(BaseAgent):
         # 3. Momentum Analysis (RSI/MACD)
         momentum_signal, momentum_metrics = self._analyze_momentum(df)
         
-        # 4. Ichimoku Cloud Analysis
-        ichimoku_signal, ichimoku_metrics = self._analyze_ichimoku(df)
-        
         # Combined Signal (Weighted — user-configurable)
         raw_signal = (
             momentum_signal   * weights["momentum"] +
-            ichimoku_signal   * weights["ichimoku"] +
             volume_signal     * weights["volume"] +
             volatility_signal * weights["volatility"]
         )
@@ -75,10 +69,6 @@ class QuantAgent(BaseAgent):
         if abs(momentum_signal) > 0.5:
             direction = "Bullish" if momentum_signal > 0 else "Bearish"
             reasoning_parts.append(f"{direction} momentum (RSI/MACD)")
-            
-        if abs(ichimoku_signal) > 0.3:
-            ichi_dir = "Bullish" if ichimoku_signal > 0 else "Bearish"
-            reasoning_parts.append(f"{ichi_dir} Ichimoku Cloud signal")
 
         if abs(volume_signal) > 0.5:
              reasoning_parts.append(f"High relative volume ({volume_metrics['relative_volume']:.1f}x)")
@@ -97,7 +87,6 @@ class QuantAgent(BaseAgent):
                 **volume_metrics,
                 **volatility_metrics,
                 **momentum_metrics,
-                **ichimoku_metrics,
             },
             "weights": display_weights,
         }
@@ -176,23 +165,3 @@ class QuantAgent(BaseAgent):
             signal = -0.8 # Overbought -> Sell
             
         return signal, {"rsi": current_rsi}
-
-    def _analyze_ichimoku(self, df: pd.DataFrame) -> tuple[float, Dict]:
-        """
-        Analyze Ichimoku Cloud for trend direction, momentum, and S/R.
-        """
-        result = analyze_ichimoku(df)
-        
-        metrics = {
-            "ichimoku_trend": result["trend"],
-            "ichimoku_momentum": result["momentum"],
-            "ichimoku_signal": result["signal"],
-            "ichimoku_cloud_support": result["cloud_support"],
-            "ichimoku_cloud_resistance": result["cloud_resistance"],
-        }
-        
-        # Pass through the detailed metrics too
-        if result.get("metrics"):
-            metrics.update({f"ichimoku_{k}": v for k, v in result["metrics"].items()})
-        
-        return result["signal"], metrics

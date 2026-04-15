@@ -6,7 +6,6 @@ import os
 import pandas as pd
 import numpy as np
 from .base_agent import BaseAgent
-from indicators.ichimoku import analyze_ichimoku
 
 logger = logging.getLogger(__name__)
 
@@ -85,35 +84,11 @@ class PatternAgent(BaseAgent):
         prev_price = float(df['Close'].iloc[-2]) if len(df) > 1 else current_price
         price_change_pct = ((current_price - prev_price) / prev_price * 100) if prev_price else 0
 
-        # 1b. Ichimoku Cloud — dynamic S/R and trend confirmation
-        ichimoku_result = analyze_ichimoku(df)
-        ichimoku_trend = ichimoku_result.get("trend", "neutral")
-        cloud_support = ichimoku_result.get("cloud_support")
-        cloud_resistance = ichimoku_result.get("cloud_resistance")
-
-        # Merge Ichimoku cloud levels into support/resistance
-        if cloud_support and cloud_support not in support:
-            support.append(cloud_support)
-            support = sorted(support)
-        if cloud_resistance and cloud_resistance not in resistance:
-            resistance.append(cloud_resistance)
-            resistance = sorted(resistance)
-
-        # Enhance trend with Ichimoku confirmation
-        if trend == "neutral" and ichimoku_trend != "neutral":
-            trend = f"{ichimoku_trend} (Ichimoku)"
-        elif trend in ("uptrend", "downtrend") and ichimoku_trend == trend.replace("uptrend", "bullish").replace("downtrend", "bearish"):
-            trend = f"{trend} (confirmed by Ichimoku)"
-
         metrics = {
             "support_levels": support,
             "resistance_levels": resistance,
             "breakout": breakout,
             "trend": trend,
-            "ichimoku_trend": ichimoku_trend,
-            "ichimoku_momentum": ichimoku_result.get("momentum", "neutral"),
-            "cloud_support": cloud_support,
-            "cloud_resistance": cloud_resistance,
         }
 
         # 2. Try LLM reasoning

@@ -1,30 +1,27 @@
 import React, { useState, useEffect } from 'react';
 
 interface QuantWeightsProps {
-  weights: Record<string, number>;  // e.g. {momentum: 30, ichimoku: 25, volume: 25, volatility: 20}
+  weights: Record<string, number>;  // e.g. {momentum: 40, volume: 35, volatility: 25}
   onChange: (weights: Record<string, number>) => void;
   disabled?: boolean;
 }
 
 const LABELS: Record<string, string> = {
   momentum: 'Momentum (RSI)',
-  ichimoku: 'Ichimoku Cloud',
   volume: 'Volume',
   volatility: 'Volatility (BB)',
 };
 
 const COLORS: Record<string, string> = {
   momentum: '#60a5fa',
-  ichimoku: '#a78bfa',
   volume: '#34d399',
   volatility: '#fbbf24',
 };
 
 export const DEFAULT_QUANT_WEIGHTS: Record<string, number> = {
-  momentum: 30,
-  ichimoku: 25,
-  volume: 25,
-  volatility: 20,
+  momentum: 40,
+  volume: 35,
+  volatility: 25,
 };
 
 export default function QuantWeights({ weights, onChange, disabled }: QuantWeightsProps) {
@@ -56,10 +53,9 @@ export default function QuantWeights({ weights, onChange, disabled }: QuantWeigh
     setLocalWeights({ ...DEFAULT_QUANT_WEIGHTS });
     // Also apply the reset immediately
     onChange({
-      momentum: 0.30,
-      ichimoku: 0.25,
-      volume: 0.25,
-      volatility: 0.20,
+      momentum: 0.40,
+      volume: 0.35,
+      volatility: 0.25,
     });
   };
 

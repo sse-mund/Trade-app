@@ -364,42 +364,6 @@ function App() {
                   {!isIntraday && data.indicators.sma_50 !== undefined && <div className="indicator-item">SMA(50): ${data.indicators.sma_50?.toFixed(2) ?? 'N/A'}</div>}
                 </div>
 
-                {/* Ichimoku Cloud Indicators */}
-                {!isIntraday && data.analysis?.agent_results?.quant?.metrics?.ichimoku_trend && (
-                  <>
-                    <h4 style={{ margin: '1rem 0 0.5rem', fontSize: '1rem', color: 'var(--text-secondary)' }}>Ichimoku Cloud</h4>
-                    <div className="indicators-grid">
-                      <div className="indicator-item" style={{
-                        borderLeft: `3px solid ${data.analysis.agent_results.quant.metrics.ichimoku_trend === 'bullish' ? '#22c55e' : data.analysis.agent_results.quant.metrics.ichimoku_trend === 'bearish' ? '#ef4444' : '#f59e0b'}`
-                      }}>
-                        Trend: {data.analysis.agent_results.quant.metrics.ichimoku_trend}
-                      </div>
-                      <div className="indicator-item">
-                        Momentum: {data.analysis.agent_results.quant.metrics.ichimoku_momentum ?? 'N/A'}
-                      </div>
-                      {data.analysis.agent_results.quant.metrics.ichimoku_cloud_support != null && (
-                        <div className="indicator-item" style={{ borderLeft: '3px solid #22c55e' }}>
-                          Cloud Support: ${data.analysis.agent_results.quant.metrics.ichimoku_cloud_support.toFixed(2)}
-                        </div>
-                      )}
-                      {data.analysis.agent_results.quant.metrics.ichimoku_cloud_resistance != null && (
-                        <div className="indicator-item" style={{ borderLeft: '3px solid #ef4444' }}>
-                          Cloud Resistance: ${data.analysis.agent_results.quant.metrics.ichimoku_cloud_resistance.toFixed(2)}
-                        </div>
-                      )}
-                      {data.analysis.agent_results.quant.metrics.ichimoku_tenkan_sen != null && (
-                        <div className="indicator-item">
-                          Tenkan: ${data.analysis.agent_results.quant.metrics.ichimoku_tenkan_sen.toFixed(2)}
-                        </div>
-                      )}
-                      {data.analysis.agent_results.quant.metrics.ichimoku_kijun_sen != null && (
-                        <div className="indicator-item">
-                          Kijun: ${data.analysis.agent_results.quant.metrics.ichimoku_kijun_sen.toFixed(2)}
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
               </div>
             )}
 
