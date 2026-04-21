@@ -117,10 +117,86 @@ def _build_analysis_prompt(state: AgentState) -> str:
 # LangGraph Nodes
 # ────────────────────────────────────────────────────────────────────────────
 
+def _fix_unquoted_values(text):
+    """Fix unquoted string values and missing commas in malformed LLM JSON."""
+    import re
+    lines = text.split('\n')
+    fixed_lines = []
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r'^(\s*"(\w+)":\s*)(.+)$', stripped)
+        if m:
+            prefix = m.group(1)
+            value_part = m.group(3).strip()
+            if (value_part.startswith('"') or
+                value_part.startswith('{') or
+                value_part.startswith('[') or
+                value_part in ('true', 'true,', 'false', 'false,', 'null', 'null,') or
+                re.match(r'^-?\d', value_part)):
+                fixed_lines.append(line)
+            else:
+                has_comma = value_part.endswith(',')
+                if has_comma:
+                    value_part = value_part[:-1].strip()
+                value_part = value_part.replace('\\', '\\\\').replace('"', '\\"')
+                leading_ws = line[:len(line) - len(line.lstrip())]
+                new_line = f'{leading_ws}{prefix}"{value_part}"{"," if has_comma else ""}'
+                fixed_lines.append(new_line)
+        else:
+            fixed_lines.append(line)
+    result_lines = []
+    for i, line in enumerate(fixed_lines):
+        stripped = line.rstrip()
+        if (stripped and
+            not stripped.endswith(',') and
+            not stripped.endswith('{') and
+            not stripped.endswith('[') and
+            stripped != '}' and
+            stripped != ']'):
+            for j in range(i + 1, len(fixed_lines)):
+                next_stripped = fixed_lines[j].strip()
+                if next_stripped:
+                    if re.match(r'^"(\w+)":', next_stripped):
+                        line = line.rstrip() + ','
+                    break
+        result_lines.append(line)
+    return '\n'.join(result_lines)
+    """
+    Fix unquoted string values in malformed JSON from LLMs.
+    
+    Handles patterns like:
+        "trade_reasoning": Target price at $260...
+    Converts to:
+        "trade_reasoning": "Target price at $260..."
+    """
+    import re
+
+    # Pattern: "key": followed by a value that is NOT:
+    #   - a quote (already a string)
+    #   - a digit/minus (number)
+    #   - true/false/null (boolean/null)
+    #   - { or [ (object/array)
+    # Capture everything until the next "key": or end of object
+    def fix_match(m):
+        key = m.group(1)
+        value = m.group(2).strip()
+        # Remove trailing comma if present
+        value = value.rstrip(',')
+        # Escape any quotes inside the value
+        value = value.replace('"', '\\"')
+        return f'"{key}": "{value}"'
+
+    # Match: "key": <unquoted text> up to the next "key": or closing brace
+    pattern = r'"(\w+)":\s*(?!["{\[\dtfn-])(.+?)(?=\s*"\w+":|\s*[}])'
+    fixed = re.sub(pattern, fix_match, text, flags=re.DOTALL)
+    
+    return fixed
+
+
 def _safe_json_parse(content: str) -> Optional[dict]:
     """
     Try to parse JSON content. If it fails (e.g. truncated response),
-    attempt to close the JSON object and try again before giving up.
+    attempt multiple repair strategies before giving up.
     """
     # Attempt 1: direct parse
     try:
@@ -128,15 +204,35 @@ def _safe_json_parse(content: str) -> Optional[dict]:
     except json.JSONDecodeError:
         pass
 
-    # Attempt 2: close unclosed JSON object (handle LLM token cutoff)
+    # Attempt 2: fix unquoted string values
     try:
-        # Count open braces to determine how many closing braces needed
-        opens = content.count("{")
-        closes = content.count("}")
+        fixed = _fix_unquoted_values(content)
+        return json.loads(fixed)
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # Attempt 3: close unclosed JSON object (handle LLM token cutoff)
+    try:
+        repaired = content.rstrip().rstrip(",")
+        # Fix unquoted values first
+        repaired = _fix_unquoted_values(repaired)
+        opens = repaired.count("{")
+        closes = repaired.count("}")
         if opens > closes:
-            # Close any open string first (look for unclosed quote in last segment)
-            repaired = content.rstrip().rstrip(",")
-            # If the last char is in the middle of a string value, close it
+            if repaired.count('"') % 2 != 0:
+                repaired += '"'
+            repaired += "}" * (opens - closes)
+            return json.loads(repaired)
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    # Attempt 4: fix unquoted values + close truncated braces
+    try:
+        repaired = _fix_unquoted_values(content)
+        repaired = repaired.rstrip().rstrip(",")
+        opens = repaired.count("{")
+        closes = repaired.count("}")
+        if opens > closes:
             if repaired.count('"') % 2 != 0:
                 repaired += '"'
             repaired += "}" * (opens - closes)
@@ -147,45 +243,84 @@ def _safe_json_parse(content: str) -> Optional[dict]:
     return None
 
 
+def _extract_json_from_text(text: str) -> Optional[dict]:
+    """
+    Extract a JSON object from raw LLM text that may contain
+    surrounding prose, markdown fences, unquoted values, etc.
+    """
+    import re
+
+    text = text.strip()
+
+    # Strip markdown code fences — check ```json BEFORE bare ```
+    fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    # Try direct parse first
+    result = _safe_json_parse(text)
+    if result and len(result) > 0:
+        return result
+
+    # Try to find a JSON object in the text using regex
+    json_match = re.search(r'\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}', text, re.DOTALL)
+    if json_match:
+        result = _safe_json_parse(json_match.group())
+        if result and len(result) > 0:
+            return result
+
+    return None
+
+
 def synthesize_with_llm(state: AgentState) -> dict:
     """
     Node: Send agent metrics to Ollama LLM for synthesis.
-    Returns updated state with llm_output or error.
+
+    Strategy:
+    1. Use the base model (llama3.2:3b) WITHOUT format="json"
+       to avoid empty {} responses.
+    2. Extract JSON from raw text ourselves.
     """
     try:
         from langchain_ollama import ChatOllama
 
-        model_name = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-        llm = ChatOllama(
-            model=model_name,
-            temperature=0.3,
-            num_predict=2048,  # Increased: 600 was causing truncated JSON responses
-            format="json",
-        )
+        model_name = "llama3.2:3b"
 
         prompt = _build_analysis_prompt(state)
-
         messages = [
             ("system", SYSTEM_PROMPT),
             ("human", prompt),
         ]
 
-        logger.info(f"LangGraph Brain: Sending analysis to Ollama ({model_name})...")
-        response = llm.invoke(messages)
+        parsed = None
+        try:
+            llm = ChatOllama(
+                model=model_name,
+                temperature=0.3,
+                num_predict=4096,
+            )
 
-        # Parse JSON from response
-        content = response.content.strip()
-        # Strip markdown code fences if present
-        if content.startswith("```"):
-            content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
+            logger.info(f"LangGraph Brain: Sending analysis to Ollama ({model_name})...")
+            response = llm.invoke(messages)
+            content = response.content.strip()
 
-        parsed = _safe_json_parse(content)
-        if parsed is None:
-            logger.warning(f"LangGraph Brain: Raw LLM content (unparseable): {content[:500]}")
-            raise json.JSONDecodeError("Could not parse or repair LLM JSON", content, 0)
+            logger.info(f"LangGraph Brain: Raw response from {model_name} ({len(content)} chars): {content[:500]}")
+
+            parsed = _extract_json_from_text(content)
+
+            if parsed and len(parsed) > 0:
+                logger.info(f"LangGraph Brain: Got {len(parsed)} keys from {model_name}")
+            else:
+                logger.warning(f"LangGraph Brain: {model_name} returned no extractable JSON")
+                parsed = None
+
+        except Exception as model_err:
+            logger.warning(f"LangGraph Brain: {model_name} failed: {model_err}")
+            parsed = None
+
+        if parsed is None or len(parsed) == 0:
+            return {"llm_output": None, "error": "Model returned empty JSON"}
+
 
         rec = parsed.get('recommendation')
         logger.info(f"LangGraph Brain: LLM returned recommendation={rec}")
@@ -193,8 +328,6 @@ def synthesize_with_llm(state: AgentState) -> dict:
         # Validate the parsed output has required fields
         if rec is None:
             logger.warning(f"LangGraph Brain: LLM JSON keys: {list(parsed.keys())}")
-            logger.warning(f"LangGraph Brain: Raw LLM content: {content[:500]}")
-            # Try common alternative keys the model might use
             for alt_key in ['Recommendation', 'action', 'Action', 'signal', 'Signal', 'decision', 'Decision']:
                 if alt_key in parsed:
                     parsed['recommendation'] = parsed[alt_key]
@@ -203,12 +336,10 @@ def synthesize_with_llm(state: AgentState) -> dict:
 
         return {"llm_output": parsed, "error": None}
 
-    except json.JSONDecodeError as e:
-        logger.warning(f"LangGraph Brain: Failed to parse LLM JSON: {e}")
-        return {"llm_output": None, "error": f"JSON parse error: {e}"}
     except Exception as e:
         logger.warning(f"LangGraph Brain: Ollama error: {e}")
         return {"llm_output": None, "error": str(e)}
+
 
 
 def format_output(state: AgentState) -> dict:
@@ -401,5 +532,6 @@ class LangGraphBrain:
             }
 
         except Exception as e:
-            logger.warning(f"LangGraphBrain error: {e}")
+            import traceback
+            logger.warning(f"LangGraphBrain error: {e}\n{traceback.format_exc()}")
             return None

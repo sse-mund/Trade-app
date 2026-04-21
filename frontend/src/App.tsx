@@ -12,6 +12,7 @@ import Watchlist from './components/Watchlist'
 import BuyRecommendations from './components/BuyRecommendations'
 import TickerAutocomplete from './components/TickerAutocomplete'
 import QuantWeights, { DEFAULT_QUANT_WEIGHTS } from './components/QuantWeights'
+import LogViewer from './components/LogViewer'
 
 // All strategies are always analyzed
 const ALL_STRATEGIES = ['SMA', 'RSI', 'MACD'];
@@ -370,6 +371,11 @@ function App() {
           </div>
         )}
       </main>
+
+      {/* System Log Viewer — always visible at bottom */}
+      <div style={{ maxWidth: 1400, margin: '0 auto', padding: '0 1.5rem 1.5rem' }}>
+        <LogViewer />
+      </div>
     </div>
   )
 }

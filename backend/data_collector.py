@@ -119,10 +119,59 @@ class DataCollector:
         
         return successful, failed
     
-    def update_stock_data(self, ticker):
-        """Update data for a specific stock."""
-        logger.info(f"Updating data for {ticker}")
+    def update_stock_data(self, ticker, last_bar_date=None):
+        """
+        Update data for a specific stock.
+        
+        If last_bar_date is provided, do an incremental fetch from that date.
+        Otherwise, do a full 5-year fetch.
+        """
+        if last_bar_date is not None:
+            return self.incremental_update(ticker, last_bar_date)
+        
+        logger.info(f"Full update for {ticker} (no prior data)")
         return self.fetch_and_store_stock_data(ticker)
+    
+    def incremental_update(self, ticker, last_bar_date):
+        """
+        Fetch only the missing data from last_bar_date to today.
+        Much faster than re-downloading 5 years of history.
+        """
+        from datetime import timedelta
+        
+        # Start 1 day before last bar to ensure overlap (handles partial bars)
+        start_date = last_bar_date - timedelta(days=1)
+        start_str = start_date.strftime('%Y-%m-%d')
+        
+        logger.info(f"Incremental update for {ticker}: fetching from {start_str}")
+        
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(start=start_str, interval=FETCH_INTERVAL)
+            
+            if df.empty:
+                logger.warning(f"No new data available for {ticker} since {start_str}")
+                return False
+            
+            # Add Adj Close if not present
+            if 'Adj Close' not in df.columns and 'Close' in df.columns:
+                df['Adj Close'] = df['Close']
+            
+            logger.info(f"Incremental fetch: {len(df)} records for {ticker} from {df.index[0].date()} to {df.index[-1].date()}")
+            
+            # Insert/update in database (upsert — replaces existing bars for overlap dates)
+            records_inserted = self.db.insert_historical_data(ticker, df)
+            
+            if records_inserted > 0:
+                logger.info(f"Incremental update: stored {records_inserted} records for {ticker}")
+                return True
+            else:
+                logger.warning(f"Incremental update: no records stored for {ticker}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Incremental update error for {ticker}: {e}", exc_info=True)
+            return False
     
     def list_stored_stocks(self):
         """List all stocks currently in the database."""

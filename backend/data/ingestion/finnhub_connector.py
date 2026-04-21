@@ -20,6 +20,7 @@ class FinnhubConnector:
     Features:
     - Company news fetching
     - Market news fetching
+    - News sentiment (aggregate bullish/bearish — premium endpoint)
     - Rate limiting (60 calls/min on free tier)
     - Standardized output schema
     """
@@ -199,6 +200,72 @@ class FinnhubConnector:
         except Exception as e:
             logger.error(f"Error fetching Finnhub quote for {ticker}: {e}")
             return {}
+
+
+    def fetch_news_sentiment(self, ticker: str) -> Optional[Dict]:
+        """
+        Fetch aggregate news sentiment for a ticker via Finnhub's /news-sentiment endpoint.
+
+        NOTE: This is a **premium / paid** Finnhub endpoint.  On the free tier the
+        call will succeed but return an empty dict `{}`.  The caller should check
+        whether the returned dict is non-empty before using it.
+
+        Returns a dict with keys:
+            'bullishPercent'        — fraction of articles classified bullish  (0-1)
+            'bearishPercent'        — fraction of articles classified bearish  (0-1)
+            'articlesInLastWeek'    — raw article count in the last 7 days
+            'buzz'                  — news-volume ratio vs weekly average
+            'companyNewsScore'      — Finnhub's proprietary overall news score
+            'sectorAverageBullish'  — sector benchmark for bullish %
+            'compound_score'        — derived scalar in [-1, +1]:
+                                      bullishPercent - bearishPercent
+            'symbol'                — echo of the requested ticker
+        Or None if the client is not initialised / the request fails.
+        """
+        if not self.client:
+            logger.error("Finnhub client not initialized")
+            return None
+
+        try:
+            self._wait_for_rate_limit()
+            logger.info(f"Fetching Finnhub news sentiment for {ticker}")
+            raw = self.client.news_sentiment(ticker)
+
+            # The endpoint returns {} on the free tier — treat as unavailable
+            if not raw or not isinstance(raw, dict):
+                logger.warning(f"Finnhub news_sentiment returned empty/invalid for {ticker} "
+                               "(premium endpoint — check your plan)")
+                return None
+
+            sentiment = raw.get('sentiment', {})
+            buzz      = raw.get('buzz', {})
+
+            bullish  = float(sentiment.get('bullishPercent', 0.0))
+            bearish  = float(sentiment.get('bearishPercent', 0.0))
+
+            result = {
+                'bullishPercent':       bullish,
+                'bearishPercent':       bearish,
+                'articlesInLastWeek':   int(buzz.get('articlesInLastWeek', 0)),
+                'buzz':                 float(buzz.get('buzz', 0.0)),
+                'companyNewsScore':     float(raw.get('companyNewsScore', 0.0)),
+                'sectorAverageBullish': float(raw.get('sectorAverageBullishPercent', 0.0)),
+                # Compound: ranges from -1 (fully bearish) to +1 (fully bullish)
+                'compound_score':       round(bullish - bearish, 4),
+                'symbol':               raw.get('symbol', ticker),
+            }
+
+            logger.info(
+                f"Finnhub sentiment for {ticker}: "
+                f"bullish={bullish:.0%}, bearish={bearish:.0%}, "
+                f"compound={result['compound_score']:+.4f}, "
+                f"articles_this_week={result['articlesInLastWeek']}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"Error fetching Finnhub news sentiment for {ticker}: {e}")
+            return None
 
 
 # Convenience function

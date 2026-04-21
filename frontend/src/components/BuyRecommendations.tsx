@@ -49,21 +49,55 @@ const BuyRecommendations: React.FC<BuyRecommendationsProps> = ({ onSelectTicker 
 
             setProgress(`Scanning ${tickers.length} stocks for BUY signals…`);
 
-            // 2. Run batch scan
-            const scanRes = await fetch('http://localhost:8000/batch_scan', {
+            // 2. Run streaming batch scan
+            const scanRes = await fetch('http://localhost:8000/batch_scan_stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tickers }),
             });
             if (!scanRes.ok) throw new Error(await scanRes.text());
-            const data = await scanRes.json();
 
-            // 3. Filter to BUY only, sorted by confidence desc
-            const buys = (data.results || [])
-                .filter((r: BuyRec) => r.recommendation === 'BUY')
-                .sort((a: BuyRec, b: BuyRec) => (b.confidence || 0) - (a.confidence || 0));
+            const reader = scanRes.body?.getReader();
+            if (!reader) throw new Error('No stream reader');
 
-            setResults(buys);
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let completed = 0;
+            let totalBuys = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const payload = JSON.parse(line.slice(6));
+                        if (payload.type === 'result') {
+                            completed++;
+                            setProgress(`Analyzing ${completed}/${tickers.length} — ${payload.ticker}…`);
+
+                            // Only add BUY recommendations, in sorted order
+                            if (payload.recommendation === 'BUY') {
+                                totalBuys++;
+                                setResults(prev => {
+                                    const updated = [...prev, payload];
+                                    return updated.sort((a: BuyRec, b: BuyRec) =>
+                                        (b.confidence || 0) - (a.confidence || 0)
+                                    );
+                                });
+                            }
+                        } else if (payload.type === 'done') {
+                            setProgress('');
+                        }
+                    } catch { /* skip malformed SSE lines */ }
+                }
+            }
+
             setScanTime(new Date().toLocaleTimeString());
             setProgress('');
         } catch (e: any) {

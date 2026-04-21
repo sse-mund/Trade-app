@@ -1,13 +1,71 @@
 
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import json
 import logging
 import os
+import re
 import pandas as pd
 import numpy as np
 from .base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
+
+
+# ─── JSON Repair Helpers (ported from langgraph_brain.py) ────────────────────
+
+def _safe_json_parse(content: str) -> Optional[dict]:
+    """
+    Try to parse JSON content. If it fails (e.g. truncated response),
+    attempt to close the JSON object and try again before giving up.
+    """
+    # Attempt 1: direct parse
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    # Attempt 2: close unclosed JSON object (handle LLM token cutoff)
+    try:
+        opens = content.count("{")
+        closes = content.count("}")
+        if opens > closes:
+            repaired = content.rstrip().rstrip(",")
+            if repaired.count('"') % 2 != 0:
+                repaired += '"'
+            repaired += "}" * (opens - closes)
+            return json.loads(repaired)
+    except (json.JSONDecodeError, Exception):
+        pass
+
+    return None
+
+
+def _extract_json_from_text(text: str) -> Optional[dict]:
+    """
+    Extract a JSON object from raw LLM text that may contain
+    surrounding prose, markdown fences, etc.
+    """
+    text = text.strip()
+
+    # Strip markdown code fences
+    fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    # Try direct parse first
+    result = _safe_json_parse(text)
+    if result and len(result) > 0:
+        return result
+
+    # Try to find a JSON object in the text using regex
+    json_match = re.search(r'\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\}', text, re.DOTALL)
+    if json_match:
+        result = _safe_json_parse(json_match.group())
+        if result and len(result) > 0:
+            return result
+
+    return None
+
 
 
 class PatternAgent(BaseAgent):
@@ -47,7 +105,7 @@ class PatternAgent(BaseAgent):
         self._llm_checked = True
         try:
             from langchain_ollama import ChatOllama
-            model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+            model = "llama3.2:3b"
             self._llm = ChatOllama(
                 model=model,
                 temperature=0.2,
@@ -139,13 +197,13 @@ class PatternAgent(BaseAgent):
             ])
 
             content = response.content.strip()
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-                if content.endswith("```"):
-                    content = content[:-3]
-                content = content.strip()
 
-            parsed = json.loads(content)
+            # Use robust JSON extraction with repair logic
+            parsed = _extract_json_from_text(content)
+
+            if not parsed:
+                logger.warning(f"PatternAgent LLM: could not extract JSON from response ({len(content)} chars): {content[:200]}")
+                return None
 
             signal = float(parsed.get("signal", 0))
             signal = max(-1.0, min(1.0, signal))

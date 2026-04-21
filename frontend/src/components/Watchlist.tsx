@@ -97,23 +97,61 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
         }
     };
 
+    const [scanProgress, setScanProgress] = useState('');
+
     const runScan = useCallback(async () => {
         if (tickers.length === 0) return;
         setScanning(true);
+        setScanResults([]);
+        setScanProgress(`0/${tickers.length} scanned`);
+
         try {
-            const res = await fetch('http://localhost:8000/batch_scan', {
+            const res = await fetch('http://localhost:8000/batch_scan_stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ tickers }),
             });
             if (!res.ok) throw new Error(await res.text());
-            const data = await res.json();
-            setScanResults(data.results || []);
+
+            const reader = res.body?.getReader();
+            if (!reader) throw new Error('No stream reader');
+
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let completed = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const payload = JSON.parse(line.slice(6));
+                        if (payload.type === 'result') {
+                            completed++;
+                            setScanProgress(`${completed}/${tickers.length} scanned`);
+                            setScanResults(prev => {
+                                const filtered = prev.filter(r => r.ticker !== payload.ticker);
+                                return [...filtered, payload];
+                            });
+                        } else if (payload.type === 'done') {
+                            setScanProgress('');
+                        }
+                    } catch { /* skip malformed SSE lines */ }
+                }
+            }
+
             setLastScanTime(new Date().toLocaleTimeString());
         } catch (e: any) {
-            console.error('Batch scan failed:', e);
+            console.error('Batch scan stream failed:', e);
         } finally {
             setScanning(false);
+            setScanProgress('');
         }
     }, [tickers]);
 
@@ -193,7 +231,7 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
                             title="Scan all tickers for recommendations"
                         >
                             <RefreshCw size={12} style={{ animation: scanning ? 'spin 1s linear infinite' : 'none' }} />
-                            {scanning ? 'Scanning…' : 'Scan All'}
+                            {scanning ? (scanProgress || 'Scanning…') : 'Scan All'}
                         </button>
                     )}
                     {!collapsed && (

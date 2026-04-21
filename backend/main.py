@@ -1,6 +1,7 @@
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -211,13 +212,15 @@ async def analyze_charts(request: AnalyzeRequest):
         # Check if we have recent data, if not update it
         df = db.get_historical_data(ticker)
         is_stale = False
+        last_bar_date = None
         
         if not df.empty:
             last_date = df.index.max()
+            last_bar_date = last_date.date()
             
             # Use market_hours helper to see if we truly need a refresh
             if not is_data_fresh(last_date):
-                logger.info(f"Data for {ticker} is stale (Last: {last_date.date()}). Refreshing...")
+                logger.info(f"Data for {ticker} is stale (Last: {last_bar_date}). Refreshing...")
                 is_stale = True
         else:
             is_stale = True
@@ -225,7 +228,8 @@ async def analyze_charts(request: AnalyzeRequest):
         if is_stale:
              logger.info(f"Data for {ticker} is stale or missing. Fetching fresh data...")
              try:
-                data_collector.update_stock_data(ticker)
+                # Pass last_bar_date for incremental fetch (None = full 5yr fetch)
+                data_collector.update_stock_data(ticker, last_bar_date=last_bar_date)
                 # Re-fetch after update
                 df = db.get_historical_data(ticker)
                 # We updated data, so we should NOT use the old cache
@@ -362,6 +366,21 @@ async def analyze_charts(request: AnalyzeRequest):
         news_items = orchestrator.sentiment_agent.analyze_articles(news_items)
         twitter_items = orchestrator.sentiment_agent.analyze_articles(twitter_items)
 
+        # 4a-ii. Try Finnhub aggregate /news-sentiment (premium — graceful fallback)
+        finnhub_sentiment_data = None
+        try:
+            if finnhub.client:
+                finnhub_sentiment_data = finnhub.fetch_news_sentiment(ticker)
+                if finnhub_sentiment_data:
+                    logger.info(
+                        f"Finnhub aggregate sentiment for {ticker}: "
+                        f"compound={finnhub_sentiment_data.get('compound_score', 'N/A')}"
+                    )
+                else:
+                    logger.info(f"Finnhub aggregate sentiment unavailable for {ticker} (free tier or no data)")
+        except Exception as fh_sent_err:
+            logger.warning(f"Could not fetch Finnhub aggregate sentiment for {ticker}: {fh_sent_err}")
+
         # 4b. Prepare data package for agents (includes news for SentimentAgent)
         df = db.get_historical_data(ticker) # Re-fetch to be sure
         
@@ -371,9 +390,10 @@ async def analyze_charts(request: AnalyzeRequest):
 
         all_articles = news_items + twitter_items
         analysis_data = {
-            "historical_df":  df,
-            "news_articles":  all_articles,   # ← SentimentAgent reads this
-            "quant_weights":  request.quant_weights,  # User-configurable weights
+            "historical_df":    df,
+            "news_articles":    all_articles,          # ← SentimentAgent VADER fallback
+            "finnhub_sentiment": finnhub_sentiment_data, # ← SentimentAgent priority-1
+            "quant_weights":    request.quant_weights,  # User-configurable weights
         }
 
         # 4c. Run Multi-Agent Orchestration (Pattern + Quant + Sentiment)
@@ -528,15 +548,16 @@ async def batch_scan(request: BatchScanRequest):
     results = []
     for t in tickers:
         try:
-            # 1. Refresh data if stale
+            # 1. Refresh data if stale (incremental fetch)
             df = db.get_historical_data(t)
             if not df.empty:
-                if not is_data_fresh(df.index.max()):
+                last_bar = df.index.max()
+                if not is_data_fresh(last_bar):
                     logger.info(f"Batch scan refreshing stale ticker: {t}")
-                    data_collector.update_stock_data(t)
+                    data_collector.update_stock_data(t, last_bar_date=last_bar.date())
                     df = db.get_historical_data(t)
             else:
-                data_collector.update_stock_data(t)
+                data_collector.update_stock_data(t)  # Full fetch — no prior data
                 df = db.get_historical_data(t)
 
             if df.empty or len(df) < 30:
@@ -570,18 +591,29 @@ async def batch_scan(request: BatchScanRequest):
             # 3. Fetch news for sentiment (same sources as analyze_charts)
             news_items = []
             try:
-                news_items = finnhub.get_news(t) or []
+                if newsapi.enabled:
+                    news_items = newsapi.fetch_company_news(t, hours_back=48) or []
             except Exception:
                 pass
             try:
-                news_items += newsapi.get_news(t) or []
+                if not news_items and finnhub.client:
+                    news_items = finnhub.fetch_company_news(t, hours_back=24) or []
+            except Exception:
+                pass
+
+            # 3b. Finnhub aggregate sentiment (premium; graceful fallback)
+            finnhub_sent = None
+            try:
+                if finnhub.client:
+                    finnhub_sent = finnhub.fetch_news_sentiment(t)
             except Exception:
                 pass
 
             # 4. Use the SAME orchestrator as the detailed analysis
             data_payload = {
-                'historical_df': df,
-                'news_articles': news_items,
+                'historical_df':    df,
+                'news_articles':    news_items,
+                'finnhub_sentiment': finnhub_sent,
             }
 
             synthesis = orchestrator.analyze(t, data_payload)
@@ -617,3 +649,286 @@ async def batch_scan(request: BatchScanRequest):
 
     return {"results": results}
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Streaming Batch Scan — SSE endpoint that sends results as each ticker completes
+# ──────────────────────────────────────────────────────────────────────────────
+
+@app.post("/batch_scan_stream")
+async def batch_scan_stream(request: BatchScanRequest):
+    """
+    Streaming batch scan using Server-Sent Events.
+    Sends each ticker result as an SSE event the moment it's ready,
+    so the frontend can render progressively instead of waiting for all.
+    """
+    tickers = [t.upper() for t in request.tickers]
+    logger.info(f"Streaming batch scan requested for {len(tickers)} tickers")
+
+    def generate():
+        # Send total count first so frontend can show progress
+        yield f"data: {json.dumps({'type': 'start', 'total': len(tickers)})}\n\n"
+
+        for idx, t in enumerate(tickers):
+            try:
+                # 1. Refresh data if stale (incremental fetch)
+                df = db.get_historical_data(t)
+                if not df.empty:
+                    last_bar = df.index.max()
+                    if not is_data_fresh(last_bar):
+                        logger.info(f"Stream scan refreshing stale ticker: {t}")
+                        data_collector.update_stock_data(t, last_bar_date=last_bar.date())
+                        df = db.get_historical_data(t)
+                else:
+                    data_collector.update_stock_data(t)
+                    df = db.get_historical_data(t)
+
+                if df.empty or len(df) < 30:
+                    result = {
+                        "type": "result",
+                        "index": idx,
+                        "ticker": t,
+                        "recommendation": "N/A",
+                        "confidence": 0,
+                        "current_price": None,
+                        "change_pct": None,
+                        "market_regime": "",
+                        "risk_level": "Unknown",
+                        "key_insight": "Insufficient data",
+                    }
+                    yield f"data: {json.dumps(result)}\n\n"
+                    continue
+
+                current_price = float(df['Close'].iloc[-1])
+                prev_close = float(df['Close'].iloc[-2]) if len(df) > 1 else current_price
+
+                # 2. Inject live price
+                try:
+                    quote_data = finnhub.get_quote(t)
+                    if quote_data and quote_data.get('price'):
+                        live_price_batch = quote_data['price']
+                        df = _inject_live_price(df, live_price_batch)
+                        current_price = live_price_batch
+                except Exception:
+                    pass
+
+                change_pct = round((current_price - prev_close) / prev_close * 100, 2)
+
+                # 3. Fetch news
+                news_items = []
+                try:
+                    if newsapi.enabled:
+                        news_items = newsapi.fetch_company_news(t, hours_back=48) or []
+                except Exception:
+                    pass
+                try:
+                    if not news_items and finnhub.client:
+                        news_items = finnhub.fetch_company_news(t, hours_back=24) or []
+                except Exception:
+                    pass
+
+                # 3b. Finnhub aggregate sentiment (premium; graceful fallback)
+                finnhub_sent = None
+                try:
+                    if finnhub.client:
+                        finnhub_sent = finnhub.fetch_news_sentiment(t)
+                except Exception:
+                    pass
+
+                # 4. Run orchestrator
+                data_payload = {
+                    'historical_df':    df,
+                    'news_articles':    news_items,
+                    'finnhub_sentiment': finnhub_sent,
+                }
+                synthesis = orchestrator.analyze(t, data_payload)
+
+                result = {
+                    "type": "result",
+                    "index": idx,
+                    "ticker": t,
+                    "recommendation": synthesis["recommendation"],
+                    "confidence": synthesis["confidence"],
+                    "current_price": round(current_price, 2),
+                    "change_pct": change_pct,
+                    "market_regime": synthesis.get("market_regime", ""),
+                    "risk_level": synthesis.get("risk_level", "Medium"),
+                    "key_insight": synthesis.get("key_insight", ""),
+                    "target_price": synthesis.get("target_price"),
+                    "stop_loss": synthesis.get("stop_loss"),
+                    "time_horizon": synthesis.get("time_horizon", ""),
+                    "trade_reasoning": synthesis.get("trade_reasoning", ""),
+                    "signal_strength": synthesis.get("signal", 0),
+                }
+                yield f"data: {json.dumps(result)}\n\n"
+
+            except Exception as e:
+                logger.warning(f"Stream scan failed for {t}: {e}")
+                result = {
+                    "type": "result",
+                    "index": idx,
+                    "ticker": t,
+                    "recommendation": "ERROR",
+                    "confidence": 0,
+                    "current_price": None,
+                    "change_pct": None,
+                    "market_regime": "",
+                    "risk_level": "Unknown",
+                    "key_insight": str(e),
+                }
+                yield f"data: {json.dumps(result)}\n\n"
+
+        # Signal completion
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ─── Log Viewer Endpoints ──────────────────────────────────────────────────
+
+import os as _os
+import re as _re
+import asyncio as _asyncio
+from agents.log_watcher import LogWatcherAgent
+
+_log_watcher = LogWatcherAgent(log_dir=_os.path.join(_os.path.dirname(__file__), 'logs'))
+
+
+@app.get("/logs/analysis")
+async def analyze_logs():
+    """
+    Run the Log Watcher Agent to analyze today's logs.
+    Returns health score, categorized issues, and actionable recommendations.
+    """
+    try:
+        report = _log_watcher.analyze()
+        return report
+    except Exception as e:
+        logger.error(f"Log analysis failed: {e}")
+        return {"error": str(e), "health_score": -1, "issues": [], "recommendations": []}
+
+
+def _get_log_path():
+    """Get path to today's log file."""
+    log_dir = _os.path.join(_os.path.dirname(__file__), 'logs')
+    today = datetime.now().strftime('%Y-%m-%d')
+    return _os.path.join(log_dir, f"trade_app_{today}.log")
+
+
+def _parse_log_line(line: str) -> dict:
+    """Parse a log line into a structured dict."""
+    line = line.strip()
+    if not line:
+        return None
+
+    # Format: 2026-04-15 12:52:27 - agents.langgraph_brain - WARNING - message
+    pattern = r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) - ([\w.]+) - (\w+) - (.+)$'
+    match = _re.match(pattern, line)
+
+    if match:
+        timestamp, source, level, message = match.groups()
+        return {
+            "timestamp": timestamp,
+            "source": source,
+            "level": level,
+            "message": message,
+        }
+    else:
+        # Non-standard line (traceback continuation, etc.)
+        return {
+            "timestamp": "",
+            "source": "",
+            "level": "DEBUG",
+            "message": line,
+        }
+
+
+@app.get("/logs/recent")
+async def get_recent_logs(lines: int = 200, level: str = ""):
+    """
+    Get the most recent log lines from today's log file.
+    Optional level filter: INFO, WARNING, ERROR
+    """
+    log_path = _get_log_path()
+
+    if not _os.path.exists(log_path):
+        return {"logs": [], "file": log_path, "error": "No log file for today"}
+
+    try:
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            all_lines = f.readlines()
+
+        # Parse all lines
+        parsed = []
+        for raw_line in all_lines:
+            entry = _parse_log_line(raw_line)
+            if entry is None:
+                continue
+
+            # Level filter
+            if level and entry["level"] != level.upper():
+                continue
+
+            # Skip noisy httpx / uvicorn access logs
+            if entry["source"] in ("httpx", "uvicorn.access"):
+                continue
+
+            parsed.append(entry)
+
+        # Return last N
+        recent = parsed[-lines:] if len(parsed) > lines else parsed
+
+        return {
+            "logs": recent,
+            "total": len(parsed),
+            "file": _os.path.basename(log_path),
+        }
+    except Exception as e:
+        return {"logs": [], "error": str(e)}
+
+
+@app.get("/logs/stream")
+async def stream_logs(request: Request):
+    """
+    SSE endpoint that tails the log file in real-time.
+    Frontend connects via EventSource.
+    """
+    log_path = _get_log_path()
+
+    async def event_generator():
+        if not _os.path.exists(log_path):
+            yield f"data: {json.dumps({'error': 'No log file'})}\n\n"
+            return
+
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            # Seek to end
+            f.seek(0, 2)
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                line = f.readline()
+                if line:
+                    entry = _parse_log_line(line)
+                    if entry and entry["source"] not in ("httpx", "uvicorn.access"):
+                        yield f"data: {json.dumps(entry)}\n\n"
+                else:
+                    await _asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )

@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 import logging
 
@@ -9,53 +9,76 @@ logger = logging.getLogger(__name__)
 MARKET_TZ = pytz.timezone("America/New_York")
 MARKET_CLOSE_HOUR = 16  # 4:00 PM
 
+
+def get_last_friday(today: datetime.date) -> datetime.date:
+    """Return the most recent Friday on or before the given date."""
+    weekday = today.weekday()
+    if weekday == 5:  # Saturday
+        return today - timedelta(days=1)
+    elif weekday == 6:  # Sunday
+        return today - timedelta(days=2)
+    else:
+        # Weekday: go back to last Friday
+        return today - timedelta(days=(weekday + 3) % 7)
+
+
 def get_expected_last_trading_date() -> datetime.date:
     """
-    Returns the date of the most recent market close.
+    Returns the date of the most recent completed market session.
     
-    If it's a weekday and after 4 PM ET, returns today.
-    If it's a weekday and before 4 PM ET, returns yesterday's logic.
-    If it's a weekend, returns the most recent Friday.
+    - Weekday after 4 PM ET: today
+    - Weekday before 4 PM ET: previous trading day (market still open/hasn't closed)
+    - Saturday/Sunday: most recent Friday
     """
     now_et = datetime.now(MARKET_TZ)
     today_et = now_et.date()
-    
-    # If today is a weekend
-    # 5 = Saturday, 6 = Sunday
     weekday = today_et.weekday()
     
-    if weekday == 5: # Saturday
-        return today_et - pd.Timedelta(days=1)
-    if weekday == 6: # Sunday
-        return today_et - pd.Timedelta(days=2)
-        
-    # It's a weekday. Did the market close yet?
-    if now_et.hour < MARKET_CLOSE_HOUR:
-        # Before 4 PM ET. 
-        # If it's Monday, expected is Friday (3 days ago)
-        if weekday == 0:
-            return today_et - pd.Timedelta(days=3)
-        else:
-            return today_et - pd.Timedelta(days=1)
+    # Weekend → last Friday
+    if weekday >= 5:
+        return get_last_friday(today_et)
     
-    # After 4 PM ET on a weekday - today is the expected last date
-    return today_et
+    # Weekday, after 4 PM ET → today's session is complete
+    if now_et.hour >= MARKET_CLOSE_HOUR:
+        return today_et
+    
+    # Weekday, before 4 PM ET → last completed session
+    if weekday == 0:  # Monday before 4 PM → Friday
+        return today_et - timedelta(days=3)
+    else:
+        return today_et - timedelta(days=1)
+
 
 def is_data_fresh(last_bar_date: pd.Timestamp) -> bool:
     """
-    Compares the last bar in the database to the expected last trading date.
-    Returns True if no refresh is needed.
+    Determines if historical data needs refreshing.
+    
+    Rules:
+    - Weekday after 4 PM ET:  Fresh if last bar >= today
+    - Weekday before 4 PM ET: ALWAYS stale (fetch latest intraday bar)
+    - Saturday/Sunday:         Fresh if last bar >= last Friday
     """
     if last_bar_date is None:
         return False
-        
-    expected_date = get_expected_last_trading_date()
+    
+    now_et = datetime.now(MARKET_TZ)
+    today_et = now_et.date()
+    weekday = today_et.weekday()
     last_date = last_bar_date.date()
     
-    # If last_date is today or the expected date, we are fresh.
-    # Note: Sometimes yfinance gives a partial bar for 'today' if run 
-    # slightly before 4PM or during holidays, so >= is safer.
-    is_fresh = last_date >= expected_date
+    # Weekend → fresh if we have Friday's data
+    if weekday >= 5:
+        expected = get_last_friday(today_et)
+        is_fresh = last_date >= expected
+        logger.info(f"Freshness check (weekend): Last bar={last_date}, Expected={expected} -> Fresh={is_fresh}")
+        return is_fresh
     
-    logger.info(f"Freshness check: Last bar={last_date}, Expected={expected_date} -> Fresh={is_fresh}")
-    return is_fresh
+    # Weekday, after 4 PM → fresh if we have today's data
+    if now_et.hour >= MARKET_CLOSE_HOUR:
+        is_fresh = last_date >= today_et
+        logger.info(f"Freshness check (after close): Last bar={last_date}, Expected={today_et} -> Fresh={is_fresh}")
+        return is_fresh
+    
+    # Weekday, before 4 PM → ALWAYS stale to get latest intraday data
+    logger.info(f"Freshness check (market hours): Last bar={last_date} -> Always stale during market hours")
+    return False

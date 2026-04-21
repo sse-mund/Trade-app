@@ -1,10 +1,13 @@
+# Python compiled files (all depths)
+*.pyc
+*.pyo
+__pycache__/
+
 # Python virtual env
 backend/Lib/
 backend/Scripts/
 backend/Include/
 backend/pyvenv.cfg
-backend/__pycache__/
-backend/**/__pycache__/
 
 # Database
 backend/*.db
