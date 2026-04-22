@@ -87,7 +87,7 @@ Trade Strategy AI is a **multi-agent stock analysis platform** that combines tec
 ### 🎯 Fine-Tuning Pipeline
 - **Dataset generator** — creates 59,550 training examples from 50 tickers × 5 years
 - Each example labels what **actually happened** in the next 5 trading days
-- **Google Colab notebook** — fine-tunes with QLoRA on free T4 GPU
+- **Kaggle notebook** — fine-tunes with Kaggle on T4 GPU
 - Exports GGUF model for direct import into Ollama
 
 ---
