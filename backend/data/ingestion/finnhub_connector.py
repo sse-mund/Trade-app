@@ -117,6 +117,10 @@ class FinnhubConnector:
                 })
             
             logger.info(f"Fetched {len(standardized)} news articles for {ticker}")
+            # Sort by most recent first and filter to requested window
+            cutoff_ts = int(from_date.timestamp())
+            standardized = [a for a in standardized if a['datetime'] >= cutoff_ts]
+            standardized.sort(key=lambda x: x['datetime'], reverse=True)
             return standardized
             
         except Exception as e:

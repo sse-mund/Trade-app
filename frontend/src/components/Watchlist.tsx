@@ -4,6 +4,7 @@ import { Plus, X, Star, TrendingUp, RefreshCw } from 'lucide-react';
 interface WatchlistProps {
     onSelectTicker: (ticker: string) => void;
     activeTicker?: string;
+    onTickersChange?: (tickers: string[]) => void;
 }
 
 interface ScanResult {
@@ -17,6 +18,7 @@ interface ScanResult {
     key_insight: string;
     target_price?: number | null;
     stop_loss?: number | null;
+    llm_used?: boolean;  // false = Ollama unavailable, expert system was used
 }
 
 const STORAGE_KEY = 'trade_strategy_watchlist';
@@ -55,7 +57,13 @@ const riskColor = (risk: string) => {
     return '#6b7280';
 };
 
-const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) => {
+type SortKey = 'ticker' | 'current_price' | 'change_pct' | 'recommendation' | 'confidence' | 'market_regime' | 'risk_level';
+type SortDir = 'asc' | 'desc' | null;
+
+const riskOrder: Record<string, number> = { Low: 0, Medium: 1, High: 2 };
+const recOrder: Record<string, number> = { BUY: 0, HOLD: 1, SELL: 2 };
+
+const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker, onTickersChange }) => {
     const [tickers, setTickers] = useState<string[]>(loadWatchlist);
     const [input, setInput] = useState('');
     const [isAdding, setIsAdding] = useState(false);
@@ -63,9 +71,12 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
     const [scanResults, setScanResults] = useState<ScanResult[]>([]);
     const [scanning, setScanning] = useState(false);
     const [lastScanTime, setLastScanTime] = useState<string | null>(null);
+    const [sortKey, setSortKey] = useState<SortKey | null>(null);
+    const [sortDir, setSortDir] = useState<SortDir>(null);
 
     useEffect(() => {
         saveWatchlist(tickers);
+        if (onTickersChange) onTickersChange(tickers);
     }, [tickers]);
 
     const addTicker = () => {
@@ -75,6 +86,7 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
             setIsAdding(false);
             return;
         }
+        pendingTickerRef.current = t;
         setTickers(prev => [...prev, t]);
         setInput('');
         setIsAdding(false);
@@ -155,15 +167,288 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
         }
     }, [tickers]);
 
+    // Scan a single ticker (used when adding a new ticker)
+    const pendingTickerRef = React.useRef<string | null>(null);
+    const [scanningTicker, setScanningTicker] = useState<string | null>(null);
+
+    const scanSingleTicker = useCallback(async (ticker: string) => {
+        setScanningTicker(ticker);
+        try {
+            const res = await fetch('http://localhost:8000/batch_scan_stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tickers: [ticker] }),
+            });
+            if (!res.ok) throw new Error(await res.text());
+
+            const reader = res.body?.getReader();
+            if (!reader) throw new Error('No stream reader');
+
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const payload = JSON.parse(line.slice(6));
+                        if (payload.type === 'result') {
+                            setScanResults(prev => {
+                                const filtered = prev.filter(r => r.ticker !== payload.ticker);
+                                return [...filtered, payload];
+                            });
+                        }
+                    } catch { /* skip malformed SSE lines */ }
+                }
+            }
+        } catch (e: any) {
+            console.error(`Single ticker scan failed for ${ticker}:`, e);
+        } finally {
+            setScanningTicker(null);
+        }
+    }, []);
+
     // Auto-scan when tickers change
     const prevTickersLen = React.useRef(tickers.length);
     useEffect(() => {
-        // Scan on initial load if we have tickers, OR if a new ticker was added
-        if (tickers.length > 0 && (scanResults.length === 0 || tickers.length > prevTickersLen.current)) {
+        if (tickers.length === 0) {
+            prevTickersLen.current = 0;
+            return;
+        }
+        // Initial load — scan all tickers
+        if (scanResults.length === 0 && tickers.length > 0) {
             runScan();
+        }
+        // New ticker added — scan only the new one
+        else if (tickers.length > prevTickersLen.current && pendingTickerRef.current) {
+            scanSingleTicker(pendingTickerRef.current);
+            pendingTickerRef.current = null;
         }
         prevTickersLen.current = tickers.length;
     }, [tickers.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const handleSort = (key: SortKey) => {
+        if (sortKey !== key) {
+            setSortKey(key);
+            setSortDir('asc');
+        } else if (sortDir === 'asc') {
+            setSortDir('desc');
+        } else if (sortDir === 'desc') {
+            setSortKey(null);
+            setSortDir(null);
+        } else {
+            setSortDir('asc');
+        }
+    };
+
+    const sortedResults = React.useMemo(() => {
+        if (!sortKey || !sortDir) return scanResults;
+        return [...scanResults].sort((a, b) => {
+            let av: any, bv: any;
+            switch (sortKey) {
+                case 'ticker':         av = a.ticker;         bv = b.ticker; break;
+                case 'current_price':  av = a.current_price ?? -Infinity; bv = b.current_price ?? -Infinity; break;
+                case 'change_pct':     av = a.change_pct    ?? -Infinity; bv = b.change_pct    ?? -Infinity; break;
+                case 'confidence':     av = a.confidence    ?? 0;          bv = b.confidence    ?? 0; break;
+                case 'market_regime':  av = a.market_regime ?? '';          bv = b.market_regime ?? ''; break;
+                case 'recommendation': av = recOrder[a.recommendation] ?? 99; bv = recOrder[b.recommendation] ?? 99; break;
+                case 'risk_level':     av = riskOrder[a.risk_level]    ?? 99; bv = riskOrder[b.risk_level]    ?? 99; break;
+                default: return 0;
+            }
+            if (av < bv) return sortDir === 'asc' ? -1 : 1;
+            if (av > bv) return sortDir === 'asc' ? 1 : -1;
+            return 0;
+        });
+    }, [scanResults, sortKey, sortDir]);
+
+    // ── Shared row renderer ── (used by each group table below)
+    const ScanRow: React.FC<{ r: ScanResult }> = ({ r }) => {
+        const isActive = activeTicker?.toUpperCase() === r.ticker;
+        // llm_used is undefined for old scan results — treat undefined as true (LLM was used)
+        const expertFallback = r.llm_used === false;
+        const rowBg = isActive
+            ? 'rgba(99,102,241,0.08)'
+            : expertFallback
+                ? 'rgba(245,158,11,0.07)'
+                : 'transparent';
+        return (
+            <tr
+                key={r.ticker}
+                onClick={() => onSelectTicker(r.ticker)}
+                style={{
+                    borderBottom: '1px solid rgba(255,255,255,0.04)',
+                    cursor: 'pointer',
+                    transition: 'background 0.15s',
+                    background: rowBg,
+                    borderLeft: expertFallback ? '3px solid #f59e0b' : '3px solid transparent',
+                }}
+                onMouseEnter={e => {
+                    if (!isActive) e.currentTarget.style.background =
+                        expertFallback ? 'rgba(245,158,11,0.12)' : 'rgba(255,255,255,0.03)';
+                }}
+                onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = rowBg; }}
+            >
+                <td style={{ ...tdStyle, fontWeight: 700, color: '#e2e8f0' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                        <TrendingUp size={12} style={{ opacity: 0.5 }} />
+                        {r.ticker}
+                        {expertFallback && (
+                            <span
+                                title="⚠ Ollama model unavailable — recommendation based on expert rule system, not AI"
+                                style={{
+                                    fontSize: 10,
+                                    fontWeight: 700,
+                                    color: '#f59e0b',
+                                    background: 'rgba(245,158,11,0.15)',
+                                    border: '1px solid rgba(245,158,11,0.35)',
+                                    borderRadius: 4,
+                                    padding: '0.05rem 0.3rem',
+                                    letterSpacing: '0.02em',
+                                    cursor: 'help',
+                                }}
+                            >
+                                ⚠ Expert
+                            </span>
+                        )}
+                    </div>
+                </td>
+                <td style={{ ...tdStyle, color: '#f1f5f9', fontWeight: 600 }}>
+                    {r.current_price != null ? `$${r.current_price}` : '—'}
+                </td>
+                <td style={{
+                    ...tdStyle,
+                    fontWeight: 600,
+                    color: r.change_pct != null ? (r.change_pct >= 0 ? '#22c55e' : '#ef4444') : '#6b7280',
+                }}>
+                    {r.change_pct != null ? `${r.change_pct >= 0 ? '+' : ''}${r.change_pct}%` : '—'}
+                </td>
+                <td style={tdStyle}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                        <div style={{ width: 40, height: 5, background: '#1f2937', borderRadius: 99, overflow: 'hidden' }}>
+                            <div style={{
+                                height: '100%',
+                                width: `${(r.confidence || 0) * 100}%`,
+                                background: r.confidence > 0.6 ? '#22c55e' : r.confidence > 0.3 ? '#f59e0b' : '#ef4444',
+                                borderRadius: 99,
+                                transition: 'width 0.3s',
+                            }} />
+                        </div>
+                        <span style={{ color: '#94a3b8', fontSize: 11 }}>
+                            {Math.round((r.confidence || 0) * 100)}%
+                        </span>
+                    </div>
+                </td>
+                <td style={{ ...tdStyle, color: '#94a3b8', fontSize: 11 }}>{r.market_regime || '—'}</td>
+                <td style={{ ...tdStyle, color: riskColor(r.risk_level), fontWeight: 600, fontSize: 11 }}>{r.risk_level}</td>
+                <td style={{ ...tdStyle, color: '#6b7280', fontSize: 11, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                    title={r.key_insight}>
+                    {r.key_insight}
+                </td>
+                <td style={tdStyle}>
+                    <span
+                        onClick={(e) => removeTicker(r.ticker, e)}
+                        style={{ opacity: 0.3, cursor: 'pointer', transition: 'opacity 0.15s' }}
+                        onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+                        onMouseLeave={e => (e.currentTarget.style.opacity = '0.3')}
+                        title={`Remove ${r.ticker}`}
+                    >
+                        <X size={13} />
+                    </span>
+                </td>
+            </tr>
+        );
+    };
+
+
+    // ── Grouped table ──────────────────────────────────────────────────────
+    const GroupTable: React.FC<{
+        rows: ScanResult[];
+        label: string;
+        accent: string;
+        accentBg: string;
+        accentBorder: string;
+    }> = ({ rows, label, accent, accentBg, accentBorder }) => {
+        if (rows.length === 0) return null;
+        return (
+            <div style={{ marginBottom: '1rem' }}>
+                {/* Group header */}
+                <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                    padding: '0.35rem 0.6rem',
+                    background: accentBg,
+                    border: `1px solid ${accentBorder}`,
+                    borderRadius: '6px 6px 0 0',
+                    marginBottom: 0,
+                }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: accent, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                        {label}
+                    </span>
+                    <span style={{
+                        fontSize: 10,
+                        fontWeight: 600,
+                        color: accent,
+                        background: accentBorder,
+                        borderRadius: 99,
+                        padding: '0.1rem 0.45rem',
+                    }}>
+                        {rows.length}
+                    </span>
+                </div>
+                <div style={{ overflowX: 'auto', border: `1px solid ${accentBorder}`, borderTop: 'none', borderRadius: '0 0 6px 6px' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                        <thead>
+                            <tr style={{ borderBottom: `1px solid ${accentBorder}` }}>
+                                <SortHeader label="Ticker"     colKey="ticker" />
+                                <SortHeader label="Price"      colKey="current_price" />
+                                <SortHeader label="Change"     colKey="change_pct" />
+                                <SortHeader label="Confidence" colKey="confidence" />
+                                <SortHeader label="Regime"     colKey="market_regime" />
+                                <SortHeader label="Risk"       colKey="risk_level" />
+                                <th style={{ ...thStyle, minWidth: 180 }}>Insight</th>
+                                <th style={thStyle}></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows.map(r => <ScanRow key={r.ticker} r={r} />)}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        );
+    };
+
+    const SortHeader: React.FC<{ label: React.ReactNode; colKey: SortKey; style?: React.CSSProperties }> = ({ label, colKey, style }) => {
+        const active = sortKey === colKey;
+        const arrow = active ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+        return (
+            <th
+                style={{
+                    ...thStyle,
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    color: active ? '#e2e8f0' : '#6b7280',
+                    transition: 'color 0.15s',
+                    ...style,
+                }}
+                onClick={() => handleSort(colKey)}
+                title={`Sort by ${String(label)}`}
+            >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                    {label}
+                    {arrow && <span style={{ color: '#6366f1', fontWeight: 700, fontSize: 11 }}>{arrow}</span>}
+                </span>
+            </th>
+        );
+    };
 
     return (
         <div style={{
@@ -213,7 +498,7 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
                     {!collapsed && tickers.length > 0 && (
                         <button
                             onClick={(e) => { e.stopPropagation(); runScan(); }}
-                            disabled={scanning}
+                            disabled={scanning || !!scanningTicker}
                             style={{
                                 display: 'flex',
                                 alignItems: 'center',
@@ -332,163 +617,81 @@ const Watchlist: React.FC<WatchlistProps> = ({ onSelectTicker, activeTicker }) =
                         </div>
                     )}
 
-                    {/* ═══ Summary Table ═══ */}
+                    {/* ═══ Split tables: BUY / SELL / HOLD ═══ */}
                     {scanResults.length > 0 ? (
-                        <div style={{ overflowX: 'auto', marginBottom: '0.75rem' }}>
-                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
-                                <thead>
-                                    <tr style={{ borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
-                                        <th style={thStyle}>Ticker</th>
-                                        <th style={thStyle}>Price</th>
-                                        <th style={thStyle}>Change</th>
-                                        <th style={thStyle}>Signal</th>
-                                        <th style={thStyle}>Confidence</th>
-                                        <th style={thStyle}>Regime</th>
-                                        <th style={thStyle}>Risk</th>
-                                        <th style={{ ...thStyle, minWidth: 180 }}>Insight</th>
-                                        <th style={thStyle}></th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {scanResults.map(r => {
-                                        const isActive = activeTicker?.toUpperCase() === r.ticker;
-                                        return (
-                                            <tr
-                                                key={r.ticker}
-                                                onClick={() => onSelectTicker(r.ticker)}
-                                                style={{
-                                                    borderBottom: '1px solid rgba(255,255,255,0.04)',
-                                                    cursor: 'pointer',
-                                                    transition: 'background 0.15s',
-                                                    background: isActive ? 'rgba(99,102,241,0.08)' : 'transparent',
-                                                }}
-                                                onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = 'rgba(255,255,255,0.03)'; }}
-                                                onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
-                                            >
-                                                <td style={{ ...tdStyle, fontWeight: 700, color: '#e2e8f0' }}>
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                                                        <TrendingUp size={12} style={{ opacity: 0.5 }} />
-                                                        {r.ticker}
-                                                    </div>
-                                                </td>
-                                                <td style={{ ...tdStyle, color: '#f1f5f9', fontWeight: 600 }}>
-                                                    {r.current_price != null ? `$${r.current_price}` : '—'}
-                                                </td>
-                                                <td style={{
-                                                    ...tdStyle,
-                                                    fontWeight: 600,
-                                                    color: r.change_pct != null ? (r.change_pct >= 0 ? '#22c55e' : '#ef4444') : '#6b7280',
-                                                }}>
-                                                    {r.change_pct != null ? `${r.change_pct >= 0 ? '+' : ''}${r.change_pct}%` : '—'}
-                                                </td>
-                                                <td style={tdStyle}>
-                                                    <span style={{
-                                                        display: 'inline-block',
-                                                        padding: '0.2rem 0.6rem',
-                                                        borderRadius: 6,
-                                                        fontSize: 11,
-                                                        fontWeight: 700,
-                                                        color: recColor(r.recommendation),
-                                                        background: recBg(r.recommendation),
-                                                        letterSpacing: '0.03em',
-                                                    }}>
-                                                        {r.recommendation}
-                                                    </span>
-                                                </td>
-                                                <td style={tdStyle}>
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                                                        <div style={{
-                                                            width: 40,
-                                                            height: 5,
-                                                            background: '#1f2937',
-                                                            borderRadius: 99,
-                                                            overflow: 'hidden',
-                                                        }}>
-                                                            <div style={{
-                                                                height: '100%',
-                                                                width: `${(r.confidence || 0) * 100}%`,
-                                                                background: r.confidence > 0.6 ? '#22c55e' : r.confidence > 0.3 ? '#f59e0b' : '#ef4444',
-                                                                borderRadius: 99,
-                                                                transition: 'width 0.3s',
-                                                            }} />
-                                                        </div>
-                                                        <span style={{ color: '#94a3b8', fontSize: 11 }}>
-                                                            {Math.round((r.confidence || 0) * 100)}%
-                                                        </span>
-                                                    </div>
-                                                </td>
-                                                <td style={{ ...tdStyle, color: '#94a3b8', fontSize: 11 }}>
-                                                    {r.market_regime || '—'}
-                                                </td>
-                                                <td style={{ ...tdStyle, color: riskColor(r.risk_level), fontWeight: 600, fontSize: 11 }}>
-                                                    {r.risk_level}
-                                                </td>
-                                                <td style={{
-                                                    ...tdStyle,
-                                                    color: '#6b7280',
-                                                    fontSize: 11,
-                                                    maxWidth: 220,
-                                                    overflow: 'hidden',
-                                                    textOverflow: 'ellipsis',
-                                                    whiteSpace: 'nowrap',
-                                                }}
-                                                    title={r.key_insight}
-                                                >
-                                                    {r.key_insight}
-                                                </td>
-                                                <td style={tdStyle}>
-                                                    <span
-                                                        onClick={(e) => removeTicker(r.ticker, e)}
-                                                        style={{
-                                                            opacity: 0.3,
-                                                            cursor: 'pointer',
-                                                            transition: 'opacity 0.15s',
-                                                        }}
-                                                        onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-                                                        onMouseLeave={e => (e.currentTarget.style.opacity = '0.3')}
-                                                        title={`Remove ${r.ticker}`}
-                                                    >
-                                                        <X size={13} />
-                                                    </span>
-                                                </td>
-                                            </tr>
-                                        );
-                                    })}
-                                    {/* Render pending tickers that were just added but not yet scanned */}
-                                    {tickers.filter(t => !scanResults.find(r => r.ticker === t)).map(t => {
-                                        const isActive = activeTicker?.toUpperCase() === t;
-                                        return (
-                                            <tr
-                                                key={`pending-${t}`}
-                                                style={{
-                                                    borderBottom: '1px solid rgba(255,255,255,0.04)',
-                                                    background: isActive ? 'rgba(99,102,241,0.08)' : 'transparent',
-                                                }}
-                                            >
-                                                <td style={{ ...tdStyle, fontWeight: 700, color: '#e2e8f0', opacity: 0.6 }}>
-                                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                                                        <TrendingUp size={12} style={{ opacity: 0.5 }} />
-                                                        {t}
-                                                    </div>
-                                                </td>
-                                                <td colSpan={7} style={{ ...tdStyle, color: '#6b7280', fontStyle: 'italic', fontSize: 11 }}>
-                                                    Scanning...
-                                                </td>
-                                                <td style={tdStyle}>
-                                                    <span
-                                                        onClick={(e) => removeTicker(t, e)}
-                                                        style={{ opacity: 0.3, cursor: 'pointer', transition: 'opacity 0.15s' }}
-                                                        onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-                                                        onMouseLeave={e => (e.currentTarget.style.opacity = '0.3')}
-                                                    >
-                                                        <X size={13} />
-                                                    </span>
-                                                </td>
-                                            </tr>
-                                        )
-                                    })}
-                                </tbody>
-                            </table>
+                        <div style={{ marginBottom: '0.75rem' }}>
+                            <GroupTable
+                                rows={sortedResults.filter(r => r.recommendation === 'BUY')}
+                                label="Buy Signals"
+                                accent="#22c55e"
+                                accentBg="rgba(34,197,94,0.06)"
+                                accentBorder="rgba(34,197,94,0.2)"
+                            />
+                            <GroupTable
+                                rows={sortedResults.filter(r => r.recommendation === 'SELL')}
+                                label="Sell Signals"
+                                accent="#ef4444"
+                                accentBg="rgba(239,68,68,0.06)"
+                                accentBorder="rgba(239,68,68,0.2)"
+                            />
+                            <GroupTable
+                                rows={sortedResults.filter(r => r.recommendation !== 'BUY' && r.recommendation !== 'SELL')}
+                                label="Hold / Neutral"
+                                accent="#f59e0b"
+                                accentBg="rgba(245,158,11,0.06)"
+                                accentBorder="rgba(245,158,11,0.18)"
+                            />
+
+                            {/* Pending tickers still scanning */}
+                            {tickers.filter(t => !scanResults.find(r => r.ticker === t)).length > 0 && (
+                                <div style={{ marginBottom: '0.5rem' }}>
+                                    <div style={{
+                                        display: 'flex', alignItems: 'center', gap: '0.5rem',
+                                        padding: '0.35rem 0.6rem',
+                                        background: 'rgba(99,102,241,0.06)',
+                                        border: '1px solid rgba(99,102,241,0.2)',
+                                        borderRadius: '6px 6px 0 0',
+                                    }}>
+                                        <span style={{ fontSize: 11, fontWeight: 700, color: '#818cf8', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                                            {scanningTicker ? `Analyzing ${scanningTicker}…` : 'Scanning…'}
+                                        </span>
+                                    </div>
+                                    <div style={{ overflowX: 'auto', border: '1px solid rgba(99,102,241,0.2)', borderTop: 'none', borderRadius: '0 0 6px 6px' }}>
+                                        <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                                            <tbody>
+                                                {tickers.filter(t => !scanResults.find(r => r.ticker === t)).map(t => (
+                                                    <tr key={`pending-${t}`} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                                                        <td style={{ ...tdStyle, fontWeight: 700, color: '#e2e8f0', opacity: 0.6 }}>
+                                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                                                                <TrendingUp size={12} style={{ opacity: 0.5 }} />
+                                                                {t}
+                                                            </div>
+                                                        </td>
+                                                        <td style={{ ...tdStyle, color: '#6b7280', fontStyle: 'italic', fontSize: 11 }}>
+                                                            {scanningTicker === t ? (
+                                                                <span style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', color: '#818cf8' }}>
+                                                                    <RefreshCw size={10} style={{ animation: 'spin 1s linear infinite' }} />
+                                                                    Analyzing…
+                                                                </span>
+                                                            ) : 'Pending…'}
+                                                        </td>
+                                                        <td style={tdStyle}>
+                                                            <span
+                                                                onClick={(e) => removeTicker(t, e)}
+                                                                style={{ opacity: 0.3, cursor: 'pointer', transition: 'opacity 0.15s' }}
+                                                                onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+                                                                onMouseLeave={e => (e.currentTarget.style.opacity = '0.3')}
+                                                            >
+                                                                <X size={13} />
+                                                            </span>
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            )}
                         </div>
                     ) : tickers.length > 0 ? (
                         <div style={{

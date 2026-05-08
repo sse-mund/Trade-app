@@ -82,6 +82,7 @@ class AnalystOrchestrator:
         strategy_name = "Multi-Agent Consensus (v3 — LangGraph + Ollama)"
         
         # 4. Fall back to expert system if LLM unavailable
+        llm_used = brain_output is not None
         if brain_output is None:
             logger.info("LangGraph Brain unavailable, falling back to expert system")
             brain_output = self.expert_brain.synthesize(
@@ -124,6 +125,7 @@ class AnalystOrchestrator:
             "key_insight": brain_output.get("key_insight", ""),
             "confluence": expert_data.get("confluence", {}),
             "strategyName": strategy_name,
+            "llm_used": llm_used,  # False when Ollama unavailable and expert system was used
         }
         
         return self._sanitize_results(result)

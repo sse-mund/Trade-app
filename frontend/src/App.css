@@ -1399,3 +1399,51 @@ html {
   content: '⚡';
   flex-shrink: 0;
 }
+
+/* ─── Alert Toast Animations ──────────────────────────────── */
+
+.alert-toast--enter {
+  animation: alert-slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.alert-toast--exit {
+  animation: alert-slide-out 0.3s ease-in forwards;
+}
+
+@keyframes alert-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(100px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes alert-slide-out {
+  from {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(120px) scale(0.9);
+  }
+}
+
+@keyframes alert-shake {
+  0%, 100% { transform: translateX(0); }
+  10%, 30%, 50%, 70%, 90% { transform: translateX(-3px); }
+  20%, 40%, 60%, 80% { transform: translateX(3px); }
+}
+
+.alert-toast--critical {
+  animation: alert-slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards,
+             alert-shake 0.5s ease-in-out 0.35s;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

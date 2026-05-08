@@ -27,6 +27,11 @@ const riskColor = (r: string) => {
     return '#ef4444';
 };
 
+type SortKey = 'ticker' | 'current_price' | 'change_pct' | 'target_price' | 'upside' | 'stop_loss' | 'risk_pct' | 'time_horizon' | 'confidence' | 'market_regime' | 'risk_level';
+type SortDir = 'asc' | 'desc' | null;
+
+const riskLevelOrder: Record<string, number> = { Low: 0, Medium: 1, High: 2 };
+
 const BuyRecommendations: React.FC<BuyRecommendationsProps> = ({ onSelectTicker }) => {
     const [results, setResults] = useState<BuyRec[]>([]);
     const [scanning, setScanning] = useState(false);
@@ -34,6 +39,8 @@ const BuyRecommendations: React.FC<BuyRecommendationsProps> = ({ onSelectTicker 
     const [scanTime, setScanTime] = useState<string | null>(null);
     const [error, setError] = useState('');
     const [expanded, setExpanded] = useState<string | null>(null);
+    const [sortKey, setSortKey] = useState<SortKey | null>('confidence');
+    const [sortDir, setSortDir] = useState<SortDir>('desc');
 
     const runScan = async () => {
         setScanning(true);
@@ -110,12 +117,80 @@ const BuyRecommendations: React.FC<BuyRecommendationsProps> = ({ onSelectTicker 
 
     const calcUpside = (current: number | null, target: number | null | undefined) => {
         if (!current || !target) return null;
-        return ((target - current) / current * 100).toFixed(1);
+        return ((target - current) / current * 100);
     };
 
     const calcRisk = (current: number | null, stop: number | null | undefined) => {
         if (!current || !stop) return null;
-        return ((current - stop) / current * 100).toFixed(1);
+        return ((current - stop) / current * 100);
+    };
+
+    const handleSort = (key: SortKey) => {
+        if (sortKey !== key) {
+            setSortKey(key);
+            setSortDir('asc');
+        } else if (sortDir === 'asc') {
+            setSortDir('desc');
+        } else if (sortDir === 'desc') {
+            setSortKey(null);
+            setSortDir(null);
+        } else {
+            setSortDir('asc');
+        }
+    };
+
+    // Pre-compute derived fields for sorting
+    const enriched = React.useMemo(() => results.map(r => ({
+        ...r,
+        _upside:   calcUpside(r.current_price, r.target_price),
+        _risk_pct: calcRisk(r.current_price, r.stop_loss),
+    })), [results]);
+
+    const sortedResults = React.useMemo(() => {
+        if (!sortKey || !sortDir) return enriched;
+        return [...enriched].sort((a, b) => {
+            let av: any, bv: any;
+            switch (sortKey) {
+                case 'ticker':        av = a.ticker;          bv = b.ticker; break;
+                case 'current_price': av = a.current_price ?? -Infinity; bv = b.current_price ?? -Infinity; break;
+                case 'change_pct':    av = a.change_pct    ?? -Infinity; bv = b.change_pct    ?? -Infinity; break;
+                case 'target_price':  av = a.target_price  ?? -Infinity; bv = b.target_price  ?? -Infinity; break;
+                case 'upside':        av = a._upside        ?? -Infinity; bv = b._upside        ?? -Infinity; break;
+                case 'stop_loss':     av = a.stop_loss     ?? -Infinity; bv = b.stop_loss     ?? -Infinity; break;
+                case 'risk_pct':      av = a._risk_pct      ?? -Infinity; bv = b._risk_pct      ?? -Infinity; break;
+                case 'time_horizon':  av = a.time_horizon  ?? '';          bv = b.time_horizon  ?? ''; break;
+                case 'confidence':    av = a.confidence    ?? 0;           bv = b.confidence    ?? 0; break;
+                case 'market_regime': av = a.market_regime ?? '';          bv = b.market_regime ?? ''; break;
+                case 'risk_level':    av = riskLevelOrder[a.risk_level] ?? 99; bv = riskLevelOrder[b.risk_level] ?? 99; break;
+                default: return 0;
+            }
+            if (av < bv) return sortDir === 'asc' ? -1 : 1;
+            if (av > bv) return sortDir === 'asc' ? 1 : -1;
+            return 0;
+        });
+    }, [enriched, sortKey, sortDir]);
+
+    const SortHeader: React.FC<{ label: React.ReactNode; colKey: SortKey }> = ({ label, colKey }) => {
+        const active = sortKey === colKey;
+        const arrow = active ? (sortDir === 'asc' ? ' ↑' : ' ↓') : '';
+        return (
+            <th
+                style={{
+                    ...thStyle,
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    color: active ? '#e2e8f0' : '#6b7280',
+                    transition: 'color 0.15s',
+                }}
+                onClick={() => handleSort(colKey)}
+                title={`Sort by ${String(label)}`}
+            >
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                    {label}
+                    {arrow && <span style={{ color: '#22c55e', fontWeight: 700, fontSize: 11 }}>{arrow}</span>}
+                </span>
+            </th>
+        );
     };
 
     return (
@@ -207,39 +282,23 @@ const BuyRecommendations: React.FC<BuyRecommendationsProps> = ({ onSelectTicker 
                     <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                         <thead>
                             <tr style={{ borderBottom: '2px solid rgba(34,197,94,0.2)' }}>
-                                <th style={thStyle}>Ticker</th>
-                                <th style={thStyle}>Price</th>
-                                <th style={thStyle}>Change</th>
-                                <th style={thStyle}>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                                        <Target size={11} /> Target
-                                    </div>
-                                </th>
-                                <th style={thStyle}>Upside</th>
-                                <th style={thStyle}>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                                        <ShieldCheck size={11} /> Stop Loss
-                                    </div>
-                                </th>
-                                <th style={thStyle}>Risk %</th>
-                                <th style={thStyle}>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                                        <Clock size={11} /> Horizon
-                                    </div>
-                                </th>
-                                <th style={thStyle}>Confidence</th>
-                                <th style={thStyle}>Regime</th>
-                                <th style={thStyle}>
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
-                                        <AlertTriangle size={11} /> Risk
-                                    </div>
-                                </th>
-                            </tr>
+                                        <SortHeader label="Ticker" colKey="ticker" />
+                                        <SortHeader label="Price" colKey="current_price" />
+                                        <SortHeader label="Change" colKey="change_pct" />
+                                        <SortHeader label={<div style={{ display: 'flex', alignItems: 'center', gap: 3 }}><Target size={11} /> Target</div>} colKey="target_price" />
+                                        <SortHeader label="Upside" colKey="upside" />
+                                        <SortHeader label={<div style={{ display: 'flex', alignItems: 'center', gap: 3 }}><ShieldCheck size={11} /> Stop Loss</div>} colKey="stop_loss" />
+                                        <SortHeader label="Risk %" colKey="risk_pct" />
+                                        <SortHeader label={<div style={{ display: 'flex', alignItems: 'center', gap: 3 }}><Clock size={11} /> Horizon</div>} colKey="time_horizon" />
+                                        <SortHeader label="Confidence" colKey="confidence" />
+                                        <SortHeader label="Regime" colKey="market_regime" />
+                                        <SortHeader label={<div style={{ display: 'flex', alignItems: 'center', gap: 3 }}><AlertTriangle size={11} /> Risk</div>} colKey="risk_level" />
+                                    </tr>
                         </thead>
                         <tbody>
-                            {results.map(r => {
-                                const upside = calcUpside(r.current_price, r.target_price);
-                                const riskPct = calcRisk(r.current_price, r.stop_loss);
+                            {sortedResults.map(r => {
+                                const upside  = r._upside  != null ? r._upside.toFixed(1)  : null;
+                                const riskPct = r._risk_pct != null ? r._risk_pct.toFixed(1) : null;
                                 const isExpanded = expanded === r.ticker;
 
                                 return (

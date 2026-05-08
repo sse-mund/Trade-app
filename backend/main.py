@@ -36,8 +36,9 @@ from backtesting.backtester import Backtester
 from backtesting.metrics import compute_metrics
 from backtesting.optimizer import Optimizer
 from backtesting.walk_forward_optimizer import WalkForwardOptimizer
-from config import OPTIMIZER_TICKERS
+from config import OPTIMIZER_TICKERS, MONITOR_INTERVAL_MINUTES, OPTIMIZER_DAILY_RUN_TIME
 from market_hours import is_data_fresh
+from watchlist_monitor import MonitorScanner
 import yfinance as yf
 
 from logger_config import setup_logging
@@ -105,6 +106,10 @@ class OptimizeRequest(BaseModel):
 class WalkForwardRequest(BaseModel):
     tickers: List[str] = OPTIMIZER_TICKERS
     train_ratio: float = 0.6
+
+class MonitorScanRequest(BaseModel):
+    tickers: List[str]
+    previous_signals: Dict[str, dict] = {}  # {ticker: {recommendation, signal, rsi, sentiment_score}}
 
 
 @app.middleware("http")
@@ -274,7 +279,7 @@ async def analyze_charts(request: AnalyzeRequest):
             # Try News API first (extensive sources, 150k+ outlets)
             if newsapi.enabled:
                 logger.info("News API is enabled, fetching news...")
-                news_items = newsapi.fetch_company_news(ticker, hours_back=48)
+                news_items = newsapi.fetch_company_news(ticker, hours_back=24)  # 24h = only fresh news
                 logger.info(f"Fetched {len(news_items)} news items from News API")
             else:
                 logger.warning("News API not enabled (missing API key)")
@@ -366,20 +371,8 @@ async def analyze_charts(request: AnalyzeRequest):
         news_items = orchestrator.sentiment_agent.analyze_articles(news_items)
         twitter_items = orchestrator.sentiment_agent.analyze_articles(twitter_items)
 
-        # 4a-ii. Try Finnhub aggregate /news-sentiment (premium — graceful fallback)
+        # 4a-ii. Finnhub aggregate /news-sentiment — DISABLED (uses API quota)
         finnhub_sentiment_data = None
-        try:
-            if finnhub.client:
-                finnhub_sentiment_data = finnhub.fetch_news_sentiment(ticker)
-                if finnhub_sentiment_data:
-                    logger.info(
-                        f"Finnhub aggregate sentiment for {ticker}: "
-                        f"compound={finnhub_sentiment_data.get('compound_score', 'N/A')}"
-                    )
-                else:
-                    logger.info(f"Finnhub aggregate sentiment unavailable for {ticker} (free tier or no data)")
-        except Exception as fh_sent_err:
-            logger.warning(f"Could not fetch Finnhub aggregate sentiment for {ticker}: {fh_sent_err}")
 
         # 4b. Prepare data package for agents (includes news for SentimentAgent)
         df = db.get_historical_data(ticker) # Re-fetch to be sure
@@ -408,7 +401,7 @@ async def analyze_charts(request: AnalyzeRequest):
 
         # 6. Construct Final Response
         all_news = news_items + twitter_items
-        all_news.sort(key=lambda x: x.get("datetime", 0), reverse=True)
+        all_news.sort(key=lambda x: x.get("datetime", 0), reverse=True)  # newest first
 
         response = {
             **chart_data, # Contains 'charts', 'levels', 'indicators', 'current_price'
@@ -601,13 +594,8 @@ async def batch_scan(request: BatchScanRequest):
             except Exception:
                 pass
 
-            # 3b. Finnhub aggregate sentiment (premium; graceful fallback)
+            # 3b. Finnhub aggregate sentiment — DISABLED (uses API quota)
             finnhub_sent = None
-            try:
-                if finnhub.client:
-                    finnhub_sent = finnhub.fetch_news_sentiment(t)
-            except Exception:
-                pass
 
             # 4. Use the SAME orchestrator as the detailed analysis
             data_payload = {
@@ -726,13 +714,8 @@ async def batch_scan_stream(request: BatchScanRequest):
                 except Exception:
                     pass
 
-                # 3b. Finnhub aggregate sentiment (premium; graceful fallback)
+                # 3b. Finnhub aggregate sentiment — DISABLED (uses API quota)
                 finnhub_sent = None
-                try:
-                    if finnhub.client:
-                        finnhub_sent = finnhub.fetch_news_sentiment(t)
-                except Exception:
-                    pass
 
                 # 4. Run orchestrator
                 data_payload = {
@@ -791,14 +774,396 @@ async def batch_scan_stream(request: BatchScanRequest):
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Watchlist Monitor — Trend Reversal Detection & Alerts
+# ──────────────────────────────────────────────────────────────────────────────
+
+_monitor_scanner = MonitorScanner(
+    db=db,
+    orchestrator=orchestrator,
+    data_collector=data_collector,
+    finnhub=finnhub,
+    newsapi=newsapi,
+    reddit=reddit,
+)
+
+
+@app.post("/monitor_scan_stream")
+async def monitor_scan_stream(request: MonitorScanRequest):
+    """
+    Streaming monitor scan using Server-Sent Events.
+    Compares current analysis against previous signals and emits
+    alert events for trend reversals, RSI crossings, breakouts,
+    volume spikes, and sentiment shifts.
+    """
+    tickers = [t.upper() for t in request.tickers]
+    previous_signals = request.previous_signals or {}
+    logger.info(f"Monitor scan requested for {len(tickers)} tickers")
+
+    def generate():
+        # Send total count first
+        yield f"data: {json.dumps({'type': 'start', 'total': len(tickers)})}\n\n"
+
+        total_alerts = 0
+        scan_start = time.time()
+
+        for idx, t in enumerate(tickers):
+            prev = previous_signals.get(t) or previous_signals.get(t.upper())
+            result = _monitor_scanner.scan_ticker(t, previous=prev)
+
+            for alert in result.get('alerts', []):
+                total_alerts += 1
+                # Persist alert to database
+                details_json = json.dumps(alert.get('details', {}))
+                db.insert_alert(
+                    ticker=t,
+                    alert_type=alert['alert_type'],
+                    severity=alert['severity'],
+                    message=alert['message'],
+                    prev_rec=alert.get('previous_recommendation'),
+                    curr_rec=alert.get('current_recommendation'),
+                    prev_signal=alert.get('previous_signal'),
+                    curr_signal=alert.get('current_signal'),
+                    details=details_json,
+                )
+                # Emit alert SSE event
+                yield f"data: {json.dumps({'type': 'alert', 'index': idx, 'ticker': t, **alert})}\n\n"
+
+            # Emit current signal state (for frontend to store as "previous" next time)
+            yield f"data: {json.dumps({'type': 'status', 'index': idx, 'ticker': t, 'current': result.get('current', {}), 'alert_count': len(result.get('alerts', []))})}\n\n"
+
+        # Signal completion
+        yield f"data: {json.dumps({'type': 'done', 'alerts_count': total_alerts, 'scan_duration_s': round(time.time() - scan_start, 1)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/alerts/history")
+async def get_alert_history(limit: int = 200, hours: int = 8):
+    """Get recent alert history from the database, filtered to the last N hours."""
+    try:
+        from datetime import timedelta
+        since = datetime.utcnow() - timedelta(hours=hours)
+        since_str = since.strftime('%Y-%m-%d %H:%M:%S')
+        alerts = db.get_recent_alerts(limit=limit, since=since_str)
+        return {"alerts": alerts, "hours_window": hours}
+    except Exception as e:
+        logger.error(f"Error fetching alert history: {e}")
+        return {"alerts": [], "error": str(e)}
+
+
+@app.get("/monitor/config")
+def get_monitor_config():
+    """Return monitor configuration so frontend can read the scan interval."""
+    from config import (
+        MONITOR_INTERVAL_MINUTES,
+        MONITOR_RSI_OVERSOLD,
+        MONITOR_RSI_OVERBOUGHT,
+        MONITOR_VOLUME_SPIKE_THRESHOLD,
+        MONITOR_SENTIMENT_FLIP_THRESHOLD,
+        MONITOR_CONFIDENCE_MIN,
+    )
+    return {
+        "interval_minutes": MONITOR_INTERVAL_MINUTES,
+        "rsi_oversold": MONITOR_RSI_OVERSOLD,
+        "rsi_overbought": MONITOR_RSI_OVERBOUGHT,
+        "volume_spike_threshold": MONITOR_VOLUME_SPIKE_THRESHOLD,
+        "sentiment_flip_threshold": MONITOR_SENTIMENT_FLIP_THRESHOLD,
+        "confidence_min": MONITOR_CONFIDENCE_MIN,
+    }
+
+
 # ─── Log Viewer Endpoints ──────────────────────────────────────────────────
 
 import os as _os
 import re as _re
 import asyncio as _asyncio
 from agents.log_watcher import LogWatcherAgent
+from agents.log_analyzer import LogAnalyzerAgent
 
 _log_watcher = LogWatcherAgent(log_dir=_os.path.join(_os.path.dirname(__file__), 'logs'))
+_log_analyzer = LogAnalyzerAgent()
+
+
+# ─── Daily Log Analysis Report ─────────────────────────────────────────────
+
+@app.on_event("startup")
+async def generate_daily_log_report():
+    """On startup, generate yesterday's log analysis report (if not already done)."""
+    import threading
+
+    def _run():
+        try:
+            from datetime import timedelta
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            report_path = _os.path.join(_log_analyzer.report_dir, f"log_report_{yesterday}.md")
+            if not _os.path.exists(report_path):
+                path = _log_analyzer.generate_report(yesterday)
+                logger.info(f"Startup: generated daily log report → {path}")
+            else:
+                logger.info(f"Startup: daily log report already exists for {yesterday}")
+        except Exception as e:
+            logger.warning(f"Startup: daily log report generation failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# Shared state written by the optimizer thread — readable via /optimizer/status
+_optimizer_state: dict = {
+    "scheduled_time_et": OPTIMIZER_DAILY_RUN_TIME,
+    "last_run_date": None,
+    "last_run_status": "never_run",
+    "last_run_sharpe": None,
+    "last_run_duration_s": None,
+    "next_run_et": None,
+}
+
+@app.on_event("startup")
+async def start_daily_optimizer_scheduler():
+    """
+    On startup, launch a background daemon thread that runs the walk-forward
+    optimizer once every weekday after market close.
+
+    Schedule time is read from config (OPTIMIZER_DAILY_RUN_TIME, default 18:15 ET).
+    The optimizer retrains signal weights on OPTIMIZER_TICKERS and immediately
+    hot-reloads the orchestrator so new weights are live without a restart.
+    """
+    import threading
+    import time as _time
+    import pytz
+
+    run_time_str = OPTIMIZER_DAILY_RUN_TIME  # e.g. "18:15"
+    run_hour, run_minute = (int(x) for x in run_time_str.split(':'))
+    eastern = pytz.timezone('America/New_York')
+
+    def _optimizer_loop():
+        import time as _time2
+        logger.info(
+            f"Daily optimizer scheduler started — will run at {run_time_str} ET on weekdays"
+        )
+        last_run_date = None
+
+        def _next_run_str(today):
+            """Human-readable next scheduled run."""
+            import calendar
+            wd = today.weekday()
+            if wd < 5:  # weekday
+                return f"today at {run_time_str} ET"
+            days_until_monday = 7 - wd
+            return f"Monday at {run_time_str} ET"
+
+        while True:
+            try:
+                now_et = datetime.now(eastern)
+                today = now_et.date()
+                weekday = today.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+                is_weekday = weekday < 5
+                at_or_past_run_time = (
+                    now_et.hour > run_hour or
+                    (now_et.hour == run_hour and now_et.minute >= run_minute)
+                )
+
+                if is_weekday and at_or_past_run_time and last_run_date != today:
+                    _optimizer_state["next_run_et"] = "running now"
+                    logger.info(
+                        f"Daily optimizer: starting walk-forward optimization "
+                        f"for {OPTIMIZER_TICKERS} at {now_et.strftime('%H:%M ET')}"
+                    )
+                    _t0 = _time2.time()
+                    try:
+                        wfo = WalkForwardOptimizer(db, data_collector)
+                        result = wfo.optimize(
+                            tickers=OPTIMIZER_TICKERS,
+                            train_ratio=0.6,
+                        )
+                        duration = round(_time2.time() - _t0, 1)
+                        if 'error' not in result:
+                            global orchestrator
+                            orchestrator = AnalystOrchestrator()
+                            # Also update the monitor scanner to use refreshed orchestrator
+                            global _monitor_scanner
+                            _monitor_scanner = MonitorScanner(
+                                db=db,
+                                orchestrator=orchestrator,
+                                data_collector=data_collector,
+                                finnhub=finnhub,
+                                newsapi=newsapi,
+                                reddit=reddit,
+                            )
+                            sharpe = result.get('test_sharpe', 'N/A')
+                            _optimizer_state.update({
+                                "last_run_date": str(today),
+                                "last_run_status": "success",
+                                "last_run_sharpe": sharpe,
+                                "last_run_duration_s": duration,
+                                "next_run_et": _next_run_str(today),
+                            })
+                            logger.info(
+                                f"Daily optimizer: completed successfully — "
+                                f"test Sharpe={sharpe}, duration={duration}s, orchestrator reloaded"
+                            )
+                        else:
+                            _optimizer_state.update({
+                                "last_run_date": str(today),
+                                "last_run_status": f"error: {result['error']}",
+                                "last_run_duration_s": duration,
+                                "next_run_et": _next_run_str(today),
+                            })
+                            logger.warning(f"Daily optimizer: finished with error — {result['error']}")
+                    except Exception as e:
+                        duration = round(_time2.time() - _t0, 1)
+                        _optimizer_state.update({
+                            "last_run_date": str(today),
+                            "last_run_status": f"exception: {e}",
+                            "last_run_duration_s": duration,
+                            "next_run_et": _next_run_str(today),
+                        })
+                        logger.error(f"Daily optimizer: run failed: {e}", exc_info=True)
+
+                    last_run_date = today  # don't run again today even on failure
+                else:
+                    # Update next_run_et so the status endpoint is informative
+                    _optimizer_state["next_run_et"] = _next_run_str(today)
+
+            except Exception as e:
+                logger.error(f"Daily optimizer scheduler tick error: {e}")
+
+            _time.sleep(60)  # check every minute
+
+    threading.Thread(target=_optimizer_loop, daemon=True, name="DailyOptimizer").start()
+
+
+@app.get("/optimizer/status")
+async def get_optimizer_status():
+    """Return the daily optimizer schedule status — last run, next run, Sharpe result."""
+    return {
+        **_optimizer_state,
+        "tickers": OPTIMIZER_TICKERS,
+    }
+
+
+@app.post("/optimizer/run_now")
+async def run_optimizer_now():
+    """
+    Manually trigger the walk-forward optimizer immediately (outside schedule).
+    Runs in a background thread; returns immediately.
+    """
+    import threading, time as _t
+
+    def _run():
+        logger.info("Manual optimizer run triggered via /optimizer/run_now")
+        _optimizer_state["last_run_status"] = "running"
+        t0 = _t.time()
+        try:
+            wfo = WalkForwardOptimizer(db, data_collector)
+            result = wfo.optimize(tickers=OPTIMIZER_TICKERS, train_ratio=0.6)
+            duration = round(_t.time() - t0, 1)
+            if 'error' not in result:
+                global orchestrator, _monitor_scanner
+                orchestrator = AnalystOrchestrator()
+                _monitor_scanner = MonitorScanner(
+                    db=db, orchestrator=orchestrator,
+                    data_collector=data_collector,
+                    finnhub=finnhub, newsapi=newsapi, reddit=reddit,
+                )
+                _optimizer_state.update({
+                    "last_run_date": str(_t.time()),
+                    "last_run_status": "success",
+                    "last_run_sharpe": result.get('test_sharpe'),
+                    "last_run_duration_s": duration,
+                })
+                logger.info(f"Manual optimizer: done in {duration}s, Sharpe={result.get('test_sharpe')}")
+            else:
+                _optimizer_state["last_run_status"] = f"error: {result['error']}"
+        except Exception as e:
+            _optimizer_state["last_run_status"] = f"exception: {e}"
+            logger.error(f"Manual optimizer failed: {e}", exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name="ManualOptimizer").start()
+    return {"status": "started", "message": "Optimizer running in background — poll /optimizer/status for results"}
+
+
+@app.post("/logs/report")
+async def generate_log_report(date: str = None):
+    """
+    Generate (or regenerate) the daily log analysis report.
+
+    Args:
+        date: YYYY-MM-DD. Defaults to yesterday.
+
+    Returns:
+        The full analysis data + path to the markdown report file.
+    """
+    try:
+        report_path = _log_analyzer.generate_report(date)
+        analysis = _log_analyzer.analyze_date(date)
+        return {
+            "report_path": report_path,
+            "report_filename": _os.path.basename(report_path),
+            **analysis,
+        }
+    except Exception as e:
+        logger.error(f"Log report generation failed: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/logs/reports")
+async def list_log_reports():
+    """List all available daily log analysis reports."""
+    try:
+        report_dir = _log_analyzer.report_dir
+        if not _os.path.isdir(report_dir):
+            return {"reports": []}
+        files = sorted(
+            [f for f in _os.listdir(report_dir) if f.endswith(".md")],
+            reverse=True,
+        )
+        reports = []
+        for f in files:
+            path = _os.path.join(report_dir, f)
+            stat = _os.stat(path)
+            reports.append({
+                "filename": f,
+                "date": f.replace("log_report_", "").replace(".md", ""),
+                "size_bytes": stat.st_size,
+                "generated_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+        return {"reports": reports}
+    except Exception as e:
+        logger.error(f"Error listing log reports: {e}")
+        return {"reports": [], "error": str(e)}
+
+
+@app.get("/logs/report/{date}")
+async def get_log_report(date: str):
+    """Read a specific daily log report by date."""
+    try:
+        report_path = _os.path.join(_log_analyzer.report_dir, f"log_report_{date}.md")
+        if not _os.path.exists(report_path):
+            # Generate on the fly
+            report_path = _log_analyzer.generate_report(date)
+        with open(report_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        analysis = _log_analyzer.analyze_date(date)
+        return {
+            "date": date,
+            "content": content,
+            "health_score": analysis["health_score"],
+            "error_count": analysis.get("error_count", 0),
+            "warning_count": analysis.get("warning_count", 0),
+            "issue_count": len(analysis["issues"]),
+        }
+    except Exception as e:
+        logger.error(f"Error reading log report for {date}: {e}")
+        return {"error": str(e)}
 
 
 @app.get("/logs/analysis")

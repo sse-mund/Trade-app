@@ -167,7 +167,7 @@ class NewsAPIConnector:
                 'from': from_str,
                 'to': to_str,
                 'language': 'en',
-                'sortBy': 'relevancy',
+                'sortBy': 'publishedAt',  # Most recent first (not 'relevancy' which surfaces old articles)
                 'pageSize': 10  # Limit results
             }
             
@@ -203,9 +203,16 @@ class NewsAPIConnector:
                 })
             
             # Post-fetch English filter (belt-and-suspenders alongside language='en' param)
-            standardized = [a for a in standardized if self._is_english(
-                next((art for art in articles if art.get('title') == a['headline']), {})
-            )]
+            cutoff_ts = int(from_date.timestamp())
+            standardized = [
+                a for a in standardized
+                if self._is_english(
+                    next((art for art in articles if art.get('title') == a['headline']), {})
+                )
+                and a['datetime'] >= cutoff_ts  # Drop anything older than our window
+            ]
+            # Sort by most recent first
+            standardized.sort(key=lambda x: x['datetime'], reverse=True)
             logger.info(f"Standardized {len(standardized)} English news articles for {ticker}")
             return standardized
             

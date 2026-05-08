@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useCallback } from 'react'
 import './App.css'
 import StrategyCard from './components/StrategyCard'
 import NewsFeed from './components/NewsFeed'
@@ -13,6 +13,8 @@ import BuyRecommendations from './components/BuyRecommendations'
 import TickerAutocomplete from './components/TickerAutocomplete'
 import QuantWeights, { DEFAULT_QUANT_WEIGHTS } from './components/QuantWeights'
 import LogViewer from './components/LogViewer'
+import AlertMonitor from './components/AlertMonitor'
+import AlertHistory from './components/AlertHistory'
 
 // All strategies are always analyzed
 const ALL_STRATEGIES = ['SMA', 'RSI', 'MACD'];
@@ -39,6 +41,13 @@ function App() {
   const [period, setPeriod] = useState(90)  // Default to 3M
   const [interval, setInterval] = useState<string | null>(null)  // null = daily mode
   const [quantWeights, setQuantWeights] = useState<Record<string, number> | null>(null)
+  const [monitorEnabled, setMonitorEnabled] = useState(true)
+  const [watchlistTickers, setWatchlistTickers] = useState<string[]>([])
+  const [alertRefreshTrigger, setAlertRefreshTrigger] = useState(0)
+
+  const handleWatchlistChange = useCallback((tickers: string[]) => {
+    setWatchlistTickers(tickers);
+  }, []);
 
   const handleAnalyze = async (
     e: React.FormEvent | null,
@@ -127,12 +136,33 @@ function App() {
   return (
     <div className="app-container">
       <header className="app-header">
-        <h1>Trade Strategy AI</h1>
-        <p>Advanced Market Analysis</p>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '1rem', flexWrap: 'wrap' }}>
+          <div>
+            <h1>Trade Strategy AI</h1>
+            <p>Advanced Market Analysis</p>
+          </div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: '0.75rem' }}>
+          <AlertMonitor
+            tickers={watchlistTickers}
+            onSelectTicker={selectWatchlistTicker}
+            enabled={monitorEnabled}
+            onToggle={() => setMonitorEnabled(prev => !prev)}
+            onAlertsFound={() => setAlertRefreshTrigger(prev => prev + 1)}
+          />
+        </div>
       </header>
 
       <main className="app-main">
-        <Watchlist onSelectTicker={selectWatchlistTicker} activeTicker={ticker} />
+        <Watchlist
+          onSelectTicker={selectWatchlistTicker}
+          activeTicker={ticker}
+          onTickersChange={handleWatchlistChange}
+        />
+        <AlertHistory
+          onSelectTicker={selectWatchlistTicker}
+          refreshTrigger={alertRefreshTrigger}
+        />
         <BuyRecommendations onSelectTicker={selectWatchlistTicker} />
         <form onSubmit={handleAnalyze} className="search-form">
           <TickerAutocomplete 

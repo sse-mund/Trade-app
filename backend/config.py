@@ -85,3 +85,24 @@ HISTORICAL_PERIOD = '5y'  # 5 years of historical data
 FETCH_INTERVAL = '1d'     # Daily data
 BATCH_DELAY = 0.5         # Delay between API calls (seconds)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Watchlist Monitor Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+import os as _os
+
+MONITOR_INTERVAL_MINUTES = int(_os.getenv('MONITOR_INTERVAL_MINUTES', '10'))
+MONITOR_RSI_OVERSOLD = 30           # RSI threshold for oversold alert
+MONITOR_RSI_OVERBOUGHT = 70         # RSI threshold for overbought alert
+MONITOR_VOLUME_SPIKE_THRESHOLD = 2.0  # Relative volume multiplier to trigger alert
+MONITOR_SENTIMENT_FLIP_THRESHOLD = 0.10  # Min sentiment score change to flag
+MONITOR_CONFIDENCE_MIN = 0.5        # Minimum confidence for recommendation flip alerts
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Daily Walk-Forward Optimizer Schedule
+# ──────────────────────────────────────────────────────────────────────────────
+# Runs automatically once per day after market close to retune signal weights.
+# Time is in US/Eastern (ET). Default: 18:15 ET (15 min after close).
+# Override via env var:  OPTIMIZER_DAILY_RUN_TIME=18:15
+OPTIMIZER_DAILY_RUN_TIME = _os.getenv('OPTIMIZER_DAILY_RUN_TIME', '18:15')
+
